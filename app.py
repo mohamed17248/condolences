@@ -1,13 +1,9 @@
 """Fire Activity Explorer
-A harmonized MODIS + VIIRS burning-activity calendar for any area of interest.
+Harmonized MODIS + VIIRS burning-activity calendar for any area of interest.
 
 Run:    streamlit run app.py
 Data:   FIRMS archive downloads (https://firms.modaps.eosdis.nasa.gov/download/)
-        saved in a "data" folder next to this script, named after the region:
-            data/egypt.csv     or     data/egypt.parquet
-        Required columns: latitude, longitude, acq_date
-        Used when present: satellite, instrument, confidence, type, acq_time,
-                           brightness (MODIS), bright_ti4 (VIIRS)
+        saved in ./data/<country>.csv or ./data/<country>.parquet
 """
 
 from __future__ import annotations
@@ -16,6 +12,7 @@ import calendar
 import hashlib
 import inspect
 import json
+import random
 import re
 import unicodedata
 from html import escape
@@ -33,7 +30,7 @@ import streamlit as st
 from folium.plugins import Draw
 from matplotlib import colormaps, colors
 from shapely import wkt as shapely_wkt
-from shapely.geometry import Polygon, box, mapping, shape
+from shapely.geometry import Point, Polygon, box, mapping, shape
 from streamlit_folium import st_folium
 
 st.set_page_config(
@@ -48,15 +45,40 @@ NE_PATH = BASE_DIR / "ne_countries.geojson"
 if not NE_PATH.exists():
     NE_PATH = Path("ne_countries.geojson")
 
-MODIS_COLOR = "#4f8fc0"
-VIIRS_COLOR = "#ef6c33"
-OTHER_COLOR = "#8a8f98"
-AOI_COLOR = "#3ec1d3"
-FONT_STACK = '"Public Sans", "Segoe UI", system-ui, -apple-system, Roboto, sans-serif'
-FONT_PLOT = "Public Sans, Segoe UI, system-ui, -apple-system, Roboto, sans-serif"
+MODIS_COLOR = "#5ca4d6"
+VIIRS_COLOR = "#f06428"
+OTHER_COLOR = "#928d82"
+AOI_COLOR = "#4ecdc4"
+SAGE_COLOR = "#8fb369"
+DAY_COLOR = "#f2b138"
+NIGHT_COLOR = "#5b8fd9"
+
+FONT_UI = '"Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
+FONT_DISPLAY = '"Fraunces", Georgia, "Times New Roman", serif'
+FONT_MONO = '"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace'
+FONT_PLOT = "Plus Jakarta Sans, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+
 SENSOR_COLORS = {"MODIS": MODIS_COLOR, "VIIRS": VIIRS_COLOR, "UNKNOWN": OTHER_COLOR}
-LEVEL_COLORS = {"much_more": "#ef6c33", "more": "#d9a441", "typical": "#6f94b3",
-                "less": "#8a78c0", "much_less": "#6d5aa8", "partial": "#59635f"}
+LEVEL_COLORS = {
+    "much_more": "#f06428",
+    "more": "#e0a938",
+    "typical": "#6892b5",
+    "less": "#8976bd",
+    "much_less": "#6b57a6",
+    "partial": "#585c55",
+}
+LEVEL_LABELS = {
+    "low": "Below normal",
+    "normal": "Normal range",
+    "elevated": "Above normal",
+    "high": "Unusually high",
+    "much_more": "Much heavier",
+    "more": "Heavier than usual",
+    "typical": "Typical year",
+    "less": "Quieter than usual",
+    "much_less": "Much quieter",
+    "partial": "Partial record",
+}
 
 ALIASES = {
     "ivory coast": "côte d'ivoire",
@@ -80,7 +102,7 @@ ALIASES = {
     "czech republic": "czechia",
 }
 
-# (lat_min, lat_max, lon_min, lon_max) for microstates missing from the 110m dataset
+# Microstates left out of 110m Natural Earth polygons
 MANUAL_REGIONS = {
     "andorra": (42.4, 42.75, 1.4, 1.8),
     "liechtenstein": (47.0, 47.3, 9.5, 9.65),
@@ -114,6 +136,7 @@ MANUAL_REGIONS = {
     "cape verde": (14.8, 17.2, -25.4, -22.6),
 }
 
+# Keep overseas territories from blowing up country zoom boxes
 OVERRIDES = {
     "france": (41.0, 51.5, -5.5, 9.8),
     "united states of america": (24.0, 50.0, -125.0, -66.5),
@@ -137,8 +160,6 @@ PLATFORM_MAP = {
 MODIS_PLATFORMS = {"Terra", "Aqua"}
 VIIRS_PLATFORMS = {"SNPP", "NOAA-20", "NOAA-21"}
 
-# ---- HARMONIZATION START ---------------------------------------------------
-
 
 def normalize_platform(sat: pd.Series) -> pd.Series:
     s = sat.astype(str).str.strip().str.upper()
@@ -146,7 +167,6 @@ def normalize_platform(sat: pd.Series) -> pd.Series:
 
 
 def infer_sensor(df: pd.DataFrame, platform: pd.Series) -> pd.Series:
-    """Row-level MODIS / VIIRS label. Later rules override earlier ones."""
     sensor = pd.Series("UNKNOWN", index=df.index, dtype=object)
     if "brightness" in df:
         sensor[df["brightness"].notna()] = "MODIS"
@@ -161,9 +181,8 @@ def infer_sensor(df: pd.DataFrame, platform: pd.Series) -> pd.Series:
     return sensor
 
 
-@st.cache_data(show_spinner="Reading hotspot file…")
+@st.cache_data(show_spinner="Reading hotspot archive…")
 def read_file(path_str: str, mtime: float):
-    """Parse a FIRMS file once and keep only what the app needs."""
     path = Path(path_str)
     if path.suffix.lower() == ".parquet":
         df = pd.read_parquet(path)
@@ -185,23 +204,32 @@ def read_file(path_str: str, mtime: float):
     subset = [c for c in ("latitude", "longitude", "acq_date", "acq_time", "satellite") if c in df]
     df = df.drop_duplicates(subset=subset)
 
-    if "satellite" in df:
-        platform = normalize_platform(df["satellite"])
-    else:
-        platform = pd.Series("UNKNOWN", index=df.index)
+    platform = normalize_platform(df["satellite"]) if "satellite" in df else pd.Series("UNKNOWN", index=df.index)
     sensor = infer_sensor(df, platform)
 
-    # MODIS confidence is 0-100, VIIRS is l / n / h. Low = MODIS < 30 or VIIRS 'l'.
+    # MODIS confidence is 0-100, VIIRS uses l/n/h
     lowconf = pd.Series(False, index=df.index)
     if "confidence" in df:
         c = df["confidence"].str.strip().str.lower()
         lowconf = (pd.to_numeric(c, errors="coerce") < 30) | c.isin(["l", "low"])
 
-    # FIRMS type: 0 vegetation fire, 1 volcano, 2 other static land source, 3 offshore
+    # FIRMS type: 0 = vegetation fire, 1-3 = volcano / industrial / offshore
     nonveg = pd.Series(False, index=df.index)
     if "type" in df:
         t = pd.to_numeric(df["type"], errors="coerce")
         nonveg = t.notna() & (t != 0)
+
+    # Convert UTC acq_time + longitude into approximate local solar hour (0..23, -1 if missing)
+    local_hour = np.full(len(df), -1, dtype=np.int8)
+    if "acq_time" in df:
+        t_num = pd.to_numeric(df["acq_time"], errors="coerce")
+        valid_t = t_num.notna() & df["longitude"].notna()
+        if valid_t.any():
+            hh = np.floor(t_num[valid_t].to_numpy(float) / 100.0).clip(0, 23)
+            mm = (t_num[valid_t].to_numpy(float) % 100.0).clip(0, 59)
+            lon = df.loc[valid_t, "longitude"].to_numpy(float)
+            solar = np.floor((hh + mm / 60.0 + lon / 15.0) % 24.0).astype(np.int8)
+            local_hour[valid_t.to_numpy()] = solar
 
     out = pd.DataFrame({
         "latitude": df["latitude"].astype("float32"),
@@ -209,6 +237,7 @@ def read_file(path_str: str, mtime: float):
         "acq_date": df["acq_date"],
         "sensor": sensor.astype("category"),
         "platform": platform.astype("category"),
+        "local_hour": local_hour,
         "lowconf": lowconf.to_numpy(),
         "nonveg": nonveg.to_numpy(),
     }).reset_index(drop=True)
@@ -216,24 +245,16 @@ def read_file(path_str: str, mtime: float):
         "has_conf": "confidence" in df,
         "has_type": "type" in df,
         "has_platform": "satellite" in df,
+        "has_time": bool((local_hour >= 0).any()),
         "n_raw": len(out),
+        "n_nonveg_total": int(nonveg.sum()),
+        "n_lowconf_total": int(lowconf.sum()),
     }
     return out, flags
 
 
-@st.cache_data(show_spinner="Harmonizing sensors…")
+@st.cache_data(show_spinner="Calibrating MODIS and VIIRS records…")
 def build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly):
-    """Quality filter -> per-satellite normalization -> MODIS->VIIRS scaling -> splice.
-
-    1. Drop low-confidence and non-vegetation detections (optional).
-    2. Divide every detection by the number of satellites of that sensor already
-       flying on that date (Terra alone before Aqua, SNPP alone before NOAA-20...).
-    3. Over the months where MODIS and VIIRS both exist, compute VIIRS / MODIS
-       monthly ratios; their median is the scaling factor (optionally per calendar
-       month). A bootstrap over months gives a range, and leave-one-year-out
-       prediction gives an out-of-sample error.
-    4. Use scaled MODIS before the first full VIIRS month and VIIRS after it.
-    """
     raw, flags = read_file(path_str, mtime)
     first_seen = raw.groupby("platform", observed=True)["acq_date"].min()
 
@@ -246,13 +267,12 @@ def build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min
     n_after_qc = len(df)
 
     df["ym"] = df["acq_date"].values.astype("datetime64[M]").astype("datetime64[ns]")
-    raw_monthly = (
-        df.groupby(["ym", "sensor", "platform"], observed=True).size().reset_index(name="n")
-    )
+    raw_monthly = df.groupby(["ym", "sensor", "platform"], observed=True).size().reset_index(name="n")
 
     if viirs_mode == "snpp" and ((df["sensor"] == "VIIRS") & (df["platform"] == "SNPP")).any():
         df = df[(df["sensor"] != "VIIRS") | (df["platform"] == "SNPP")]
 
+    # Normalize each detection by active constellation size on that date
     w0 = np.ones(len(df))
     for sensor in ("MODIS", "VIIRS"):
         mask = (df["sensor"] == sensor).to_numpy()
@@ -270,14 +290,26 @@ def build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min
     has_both = modis.any() and viirs.any()
 
     info = {
-        "has_both": has_both, "factor": 1.0, "factor_ci": None,
+        "has_both": has_both,
+        "factor": 1.0,
+        "factor_ci": None,
         "seasonal_map": {m: 1.0 for m in range(1, 13)},
-        "split": None, "overlap": pd.DataFrame(), "corr": np.nan,
-        "err_single": np.nan, "err_seasonal": np.nan, "err_loyo": np.nan, "n_valid": 0,
-        "raw_monthly": raw_monthly, "flags": flags,
-        "n_raw": flags["n_raw"], "n_after_qc": n_after_qc,
-        "platforms": {s: sorted(map(str, df.loc[df["sensor"] == s, "platform"].unique()))
-                      for s in ("MODIS", "VIIRS")},
+        "split": None,
+        "overlap": pd.DataFrame(),
+        "corr": np.nan,
+        "err_single": np.nan,
+        "err_seasonal": np.nan,
+        "err_loyo": np.nan,
+        "n_valid": 0,
+        "raw_monthly": raw_monthly,
+        "flags": flags,
+        "n_raw": flags["n_raw"],
+        "n_after_qc": n_after_qc,
+        "first_seen": {str(k): v for k, v in first_seen.items() if str(k) != "UNKNOWN"},
+        "platforms": {
+            s: sorted(map(str, df.loc[df["sensor"] == s, "platform"].unique()))
+            for s in ("MODIS", "VIIRS")
+        },
     }
 
     f = np.ones(len(df))
@@ -285,7 +317,7 @@ def build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min
 
     if has_both:
         viirs_first = df.loc[viirs, "acq_date"].min()
-        split = viirs_first + pd.offsets.MonthBegin(0)       # first full VIIRS month
+        split = viirs_first + pd.offsets.MonthBegin(0)
         info["split"] = split
 
         monthly = df.groupby(["ym", "sensor"], observed=True)["w0"].sum().unstack(fill_value=0)
@@ -295,7 +327,7 @@ def build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min
         ov = monthly.loc[monthly.index >= split, ["MODIS", "VIIRS"]].copy()
 
         valid = (ov["MODIS"] >= min_monthly) & (ov["VIIRS"] >= min_monthly)
-        if valid.sum() < 6:                                   # tiny region: relax
+        if valid.sum() < 6:
             valid = (ov["MODIS"] > 0) & (ov["VIIRS"] > 0)
         ov["ratio"] = ov["VIIRS"] / ov["MODIS"].replace(0, np.nan)
         ov["valid"] = valid
@@ -322,7 +354,7 @@ def build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min
                 boots = [np.median(rng.choice(r_arr, len(r_arr))) for _ in range(500)]
                 info["factor_ci"] = (float(np.percentile(boots, 2.5)), float(np.percentile(boots, 97.5)))
 
-            # leave-one-year-out: fit on the other years, predict the held-out year
+            # Leave-one-year-out sanity check so we don't overfit
             errs = []
             for y in np.unique(yrs):
                 te = yrs == y
@@ -333,8 +365,12 @@ def build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min
             if errs:
                 info["err_loyo"] = float(np.median(errs))
 
-        info.update(factor=factor, seasonal_map=seasonal_map, overlap=ov.reset_index(),
-                    n_valid=int(valid.sum()))
+        info.update(
+            factor=factor,
+            seasonal_map=seasonal_map,
+            overlap=ov.reset_index(),
+            n_valid=int(valid.sum()),
+        )
 
         if seasonal:
             lookup = np.array([seasonal_map[m] for m in range(1, 13)])
@@ -359,7 +395,6 @@ def build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min
 
 
 def theil_sen(x, y):
-    """Robust linear trend: median of pairwise slopes."""
     x = np.asarray(x, float)
     y = np.asarray(y, float)
     slopes = [(y[j] - y[i]) / (x[j] - x[i]) for i, j in combinations(range(len(x)), 2)]
@@ -367,13 +402,7 @@ def theil_sen(x, y):
     return slope, float(np.median(y - slope * x))
 
 
-# ---- HARMONIZATION END -----------------------------------------------------
-
-# ---- HELPERS START ---------------------------------------------------------
-
-
 def rel_trend(series: pd.Series, years_full):
-    """Theil-Sen trend over complete years -> (% of median per year, slope, intercept)."""
     if len(years_full) < 5:
         return None
     y = series.reindex(years_full).fillna(0).to_numpy(float)
@@ -392,7 +421,6 @@ def circle_polygon(lon, lat, radius_m, n=72):
 
 
 def drawing_to_polygon(feat):
-    """Leaflet.draw feature (polygon, rectangle or circle) -> shapely polygon."""
     g = (feat or {}).get("geometry") or {}
     props = (feat or {}).get("properties") or {}
     if g.get("type") == "Polygon":
@@ -410,7 +438,8 @@ def drawing_to_polygon(feat):
 def _contains_xy(poly, x, y):
     try:
         return shapely.contains_xy(poly, x, y)
-    except AttributeError:                                   # shapely < 2
+    except AttributeError:
+        # shapely < 2.0 fallback
         from shapely import vectorized
         return vectorized.contains(poly, x, y)
 
@@ -428,7 +457,6 @@ def apply_aoi(df: pd.DataFrame, poly) -> pd.DataFrame:
 
 
 def status_for(current: float, hist: pd.Series):
-    """Where does the current period sit among the same days in earlier years?"""
     n = len(hist)
     med = float(hist.median())
     pct = ((hist < current).sum() + 0.5 * (hist == current).sum()) / n * 100
@@ -500,7 +528,6 @@ def short_text(ratio):
 
 
 def year_verdicts(annual_total, modis_share, pivot_cov, full_years, med_by_month, ytd=None):
-    """One plain-language verdict per year, rated against the usual (median) complete year."""
     years = sorted(int(y) for y in annual_total.index)
     full = [y for y in full_years if y in annual_total.index]
     rated = len(full) >= 4
@@ -512,8 +539,10 @@ def year_verdicts(annual_total, modis_share, pivot_cov, full_years, med_by_month
     out, run_dir, run_len, prev = [], 0, 0, None
     for y in years:
         total = float(annual_total.loc[y])
-        rec = dict(year=y, kind="partial", total=total, ratio=None, level="partial",
-                   headline="Partial year", detail="", short="not rated", rank=None, n=len(full))
+        rec = dict(
+            year=y, kind="partial", total=total, ratio=None, level="partial",
+            headline="Partial year", detail="", short="not rated", rank=None, n=len(full),
+        )
 
         if ytd is not None and y == ytd["year"] and y not in full:
             hist, cur = ytd["hist"], float(ytd["cur"])
@@ -525,11 +554,17 @@ def year_verdicts(annual_total, modis_share, pivot_cov, full_years, med_by_month
                 level, _, yhead = level_for(ratio)
             rank = int((hist > cur).sum()) + 1
             rec.update(
-                kind="ytd", ratio=ratio, level=level, headline=yhead, rank=rank,
+                kind="ytd",
+                ratio=ratio,
+                level=level,
+                headline=yhead,
+                rank=rank,
                 short=(short_text(ratio) + " so far").strip(),
-                detail=(f"{fmt(cur)} detections from January 1 to {ytd['label']}, "
-                        f"{size_text(ratio, 'the usual for these dates')}. "
-                        f"{rank_text(rank, len(hist) + 1, 'years for the same dates')}"),
+                detail=(
+                    f"{fmt(cur)} detections from January 1 to {ytd['label']}, "
+                    f"{size_text(ratio, 'the usual for these dates')}. "
+                    f"{rank_text(rank, len(hist) + 1, 'years for the same dates')}"
+                ),
             )
         elif y in full and rated:
             ratio = total / baseline if baseline > 0 else None
@@ -539,17 +574,23 @@ def year_verdicts(annual_total, modis_share, pivot_cov, full_years, med_by_month
                 level, head, _ = level_for(ratio)
             rank = int((annual_total.loc[full] > total).sum()) + 1
             tail = f" ({fmt(baseline)})." if baseline > 0 else "."
-            parts = [f"{fmt(total)} detections, {size_text(ratio)}{tail}",
-                     rank_text(rank, len(full), "complete years")]
+            parts = [
+                f"{fmt(total)} detections, {size_text(ratio)}{tail}",
+                rank_text(rank, len(full), "complete years"),
+            ]
 
             row = pivot_cov.loc[y].astype(float) if y in pivot_cov.index else None
             if row is not None and row.notna().any() and float(row.max()) > 0 and typ_peak is not None:
                 pm = int(row.idxmax())
+                # Shortest signed month offset on a 12-month circle
                 shift = ((pm - typ_peak + 6) % 12) - 6
                 if shift == 0:
                     timing = "as usual"
                 else:
-                    timing = f"{abs(shift)} month{'s' if abs(shift) > 1 else ''} {'later' if shift > 0 else 'earlier'} than usual"
+                    timing = (
+                        f"{abs(shift)} month{'s' if abs(shift) > 1 else ''} "
+                        f"{'later' if shift > 0 else 'earlier'} than usual"
+                    )
                 parts.append(f"The season peaked in {calendar.month_name[pm]}, {timing}.")
             if row is not None and has_clim:
                 best, best_r = None, 0.0
@@ -568,11 +609,20 @@ def year_verdicts(annual_total, modis_share, pivot_cov, full_years, med_by_month
                 run_len = 1 if direction != 0 else 0
             run_dir, prev = direction, y
             if run_len >= 3:
-                parts.append(f"That is the {ordinal(run_len)} year in a row {'above' if direction > 0 else 'below'} usual.")
+                parts.append(
+                    f"That is the {ordinal(run_len)} year in a row {'above' if direction > 0 else 'below'} usual."
+                )
             if float(modis_share.get(y, 0.0)) > 0.5:
                 parts.append("Mostly estimated from scaled MODIS data, so treat the size as approximate.")
-            rec.update(kind="full", ratio=ratio, level=level, headline=head, rank=rank,
-                       short=short_text(ratio) or "no usual level", detail=" ".join(parts))
+            rec.update(
+                kind="full",
+                ratio=ratio,
+                level=level,
+                headline=head,
+                rank=rank,
+                short=short_text(ratio) or "no usual level",
+                detail=" ".join(parts),
+            )
         else:
             valid = pivot_cov.loc[y].dropna() if y in pivot_cov.index else pd.Series(dtype=float)
             first_m = int(valid.index.min()) if len(valid) else None
@@ -605,7 +655,175 @@ def years_summary(vs, region_text, baseline):
     return text
 
 
-# ---- HELPERS END -----------------------------------------------------------
+def derive_field_notes(sub: pd.DataFrame, med_by_month: pd.Series, info: dict, verdicts: list, region_text: str):
+    """Synthesize plain-English fire regime clues, diurnal clock stats, and archive records from live data."""
+    notes = []
+    tot_w = float(sub["weight"].sum())
+    if tot_w <= 0:
+        return notes
+
+    # 1. Fire regime & likely driver signature (small-fire VIIRS/MODIS jump + seasonal sharpness + spatial clustering)
+    clim = med_by_month.fillna(0.0)
+    clim_sum = float(clim.sum())
+    top2_share = float(clim.nlargest(2).sum() / clim_sum) if clim_sum > 0 else 0.0
+    factor = float(info.get("factor", 1.0))
+
+    # Check if there is a distinct secondary peak separated by >= 4 months
+    bimodal_pair = None
+    if clim_sum > 0:
+        m1 = int(clim.idxmax())
+        v1 = float(clim.loc[m1])
+        if v1 > 0:
+            for m2 in range(1, 13):
+                dist = min(abs(m2 - m1), 12 - abs(m2 - m1))
+                if dist >= 4 and float(clim.loc[m2]) >= 0.45 * v1:
+                    bimodal_pair = (calendar.month_name[m1], calendar.month_name[m2])
+                    break
+
+    # Spatial concentration on a 0.25-deg grid
+    g = pd.DataFrame({
+        "la": np.floor(sub["latitude"].to_numpy() * 4) / 4,
+        "lo": np.floor(sub["longitude"].to_numpy() * 4) / 4,
+        "w": sub["weight"].to_numpy(),
+    }).groupby(["la", "lo"])["w"].sum().sort_values(ascending=False)
+    top_cells_n = max(1, int(np.ceil(len(g) * 0.10)))
+    spatial_conc = float(g.iloc[:top_cells_n].sum() / g.sum()) if len(g) > 0 else 0.0
+
+    # VIIRS catches tiny ag burns MODIS misses, so factor > 3 + sharp window usually means crop stubble
+    if info.get("has_both") and factor >= 3.2 and top2_share >= 0.50:
+        driver_tag = "Likely crop-residue burning"
+        driver_head = "Small, brief fires clustered around harvest windows"
+        driver_body = (
+            f"VIIRS picks up {factor:.1f}× more hotspots here than 1 km MODIS, and {top2_share * 100:.0f}% "
+            f"of typical annual burning lands in just two peak months. That combination is the classic "
+            f"orbital signature of post-harvest agricultural stubble clearing rather than large forest fires."
+        )
+    elif bimodal_pair is not None:
+        driver_tag = "Two-season burn cycle"
+        driver_head = f"Twin activity peaks in {bimodal_pair[0]} and {bimodal_pair[1]}"
+        driver_body = (
+            f"Instead of a single dry-season spike, burning rises twice a year—typically reflecting "
+            f"two distinct crop harvest rotations or split rainfall regimes across {region_text}."
+        )
+    elif info.get("has_both") and factor >= 2.7:
+        driver_tag = "Small-scale & fragmented fires"
+        driver_head = "Dominated by small burns below MODIS resolution"
+        driver_body = (
+            f"With a {factor:.1f}× calibration jump between MODIS and VIIRS, most detections here come from "
+            f"small, fragmented burns—common in rotational farming, pasture maintenance, and mosaic landscapes."
+        )
+    elif top2_share >= 0.62:
+        driver_tag = "Tight dry-season fire regime"
+        driver_head = f"{top2_share * 100:.0f}% of burning happens in two peak months"
+        driver_body = (
+            f"Activity stays quiet most of the year before surging sharply once vegetation dries out. "
+            f"In landscapes like this, year-to-year swings usually track rainfall deficits and fuel dryness."
+        )
+    else:
+        driver_tag = "Broad seasonal regime"
+        conc_txt = (
+            f"concentrated heavily in a few local belts ({spatial_conc * 100:.0f}% of activity in 10% of active cells)"
+            if spatial_conc >= 0.55
+            else "spread widely across the landscape"
+        )
+        driver_head = "Burning stretches across multiple months"
+        driver_body = (
+            f"Detections in {region_text} follow a gradual seasonal curve rather than a single brief spike, "
+            f"and hotspots are {conc_txt}."
+        )
+    notes.append(dict(key="regime", tag=driver_tag, head=driver_head, body=driver_body))
+
+    # 2. Local solar clock (daytime vs overnight burning)
+    lh = sub["local_hour"].to_numpy()
+    valid_lh = lh >= 0
+    if valid_lh.any():
+        hrs = lh[valid_lh]
+        wts = sub["weight"].to_numpy()[valid_lh]
+        by_hr = np.bincount(hrs, weights=wts, minlength=24)
+        peak_hr = int(np.argmax(by_hr))
+        day_share = float(by_hr[6:18].sum() / by_hr.sum())
+        night_share = 1.0 - day_share
+        if night_share >= 0.28:
+            clock_tag = "High overnight persistence"
+            clock_head = f"{night_share * 100:.0f}% of detections occur after dark"
+            clock_body = (
+                f"Activity peaks around {peak_hr:02d}:00 local solar time, yet {night_share * 100:.0f}% of "
+                f"detections happen between 18:00 and 06:00—often a sign of deep-burning peat/forest fires "
+                f"that hold heat overnight, or industrial flares if non-vegetation filtering is off."
+            )
+        else:
+            clock_tag = "Afternoon solar peak"
+            clock_head = f"{day_share * 100:.0f}% of burning happens in daylight, peaking at {peak_hr:02d}:00"
+            clock_body = (
+                f"Hotspots cluster strongly during warm afternoon hours (local solar time), when humidity drops "
+                f"and land-clearing burns are actively lit—matching sun-synchronous afternoon satellite passes."
+            )
+        notes.append(dict(key="clock", tag=clock_tag, head=clock_head, body=clock_body))
+
+    # 3. Single-day archive spike & multi-year streaks
+    daily_totals = sub.groupby("acq_date")["weight"].sum()
+    if len(daily_totals) > 0:
+        busiest_day = daily_totals.idxmax()
+        busiest_val = float(daily_totals.max())
+        full_v = [v for v in verdicts if v["kind"] == "full"]
+        streak_txt = ""
+        if len(full_v) >= 4:
+            # Longest consecutive run above or below median
+            best_len, best_dir = 0, ""
+            cur_len, cur_dir = 0, ""
+            for v in full_v:
+                d = "above" if v["level"] in ("more", "much_more") else ("below" if v["level"] in ("less", "much_less") else "")
+                if d and d == cur_dir:
+                    cur_len += 1
+                else:
+                    cur_len = 1 if d else 0
+                    cur_dir = d
+                if cur_len > best_len:
+                    best_len, best_dir = cur_len, cur_dir
+            if best_len >= 3:
+                streak_txt = f" The longest multi-year run in the archive is {best_len} consecutive years {best_dir} the median."
+        notes.append(
+            dict(
+                key="record",
+                tag="Archive extreme",
+                head=f"Single busiest day: {busiest_day:%d %b %Y}",
+                body=(
+                    f"Satellites logged {fmt(busiest_val)} VIIRS-equivalent detections in a single 24-hour UTC window "
+                    f"on {busiest_day:%B %d, %Y}.{streak_txt}"
+                ),
+            )
+        )
+
+    # 4. Orbital & sensor physics tidbit
+    flags = info.get("flags", {})
+    n_nonveg = int(flags.get("n_nonveg_total", 0))
+    first_seen = info.get("first_seen", {})
+    if n_nonveg > 0:
+        orb_tag = "Static heat masked"
+        orb_head = f"{fmt(n_nonveg)} non-vegetation heat sources filtered out"
+        orb_body = (
+            f"NASA's FIRMS classifier flagged {fmt(n_nonveg)} static thermal anomalies in this archive "
+            f"(gas flares, cement kilns, smelters, or volcanic vents) and separated them from landscape fires."
+        )
+    elif "Terra" in first_seen and "SNPP" in first_seen:
+        orb_tag = "Orbital handoff"
+        orb_head = f"25+ years bridged across {len(first_seen)} spacecraft"
+        orb_body = (
+            f"NASA Terra began logging hotspots here in {first_seen['Terra']:%b %Y}, joined by Aqua in "
+            f"{first_seen.get('Aqua', first_seen['Terra']):%b %Y}, before Suomi-NPP VIIRS took over in "
+            f"{first_seen['SNPP']:%b %Y} at 375 m resolution."
+        )
+    else:
+        lat_mid = float(sub["latitude"].mean())
+        hemi = "Northern" if lat_mid >= 0 else "Southern"
+        orb_tag = "Orbital geometry"
+        orb_head = f"Sun-synchronous passes at {abs(lat_mid):.1f}° {'N' if lat_mid >= 0 else 'S'}"
+        orb_body = (
+            f"Polar-orbiting MODIS and VIIRS instruments cross this {hemi}-Hemisphere latitude twice daily per "
+            f"satellite—once in early afternoon and once after midnight—capturing active flame fronts from 700+ km up."
+        )
+    notes.append(dict(key="orbital", tag=orb_tag, head=orb_head, body=orb_body))
+    return notes
 
 
 def polygon_area_km2(poly) -> float:
@@ -615,30 +833,31 @@ def polygon_area_km2(poly) -> float:
         return float("nan")
 
 
-# --------------------------------------------------------------------------
-# Regions
-# --------------------------------------------------------------------------
 @st.cache_data
 def load_regions():
-    """Return ({name: (lat_min, lat_max, lon_min, lon_max)}, {alias: canonical name})."""
     world = gpd.read_file(NE_PATH)
     name_col = next(c for c in ("NAME", "name", "NAME_EN", "ADMIN") if c in world.columns)
     regs = {}
+    geoms_wkb = {}
     for name, geom in zip(world[name_col], world.geometry):
         if geom is None or geom.is_empty:
             continue
+        key = str(name).lower()
         minx, miny, maxx, maxy = geom.bounds
-        regs[str(name).lower()] = (miny, maxy, minx, maxx)
+        regs[key] = (miny, maxy, minx, maxx)
+        geoms_wkb[key] = geom.wkb
 
     canon = {}
     for alias, target in ALIASES.items():
         if target in regs:
             canon[alias] = target
             regs.setdefault(alias, regs[target])
+            if target in geoms_wkb:
+                geoms_wkb.setdefault(alias, geoms_wkb[target])
     for name, bbox in MANUAL_REGIONS.items():
         regs.setdefault(name, bbox)
     regs.update(OVERRIDES)
-    return regs, canon
+    return regs, canon, geoms_wkb
 
 
 def slug(key: str, canon: dict) -> str:
@@ -661,9 +880,6 @@ def find_data_file(key: str, canon: dict):
     return None
 
 
-# --------------------------------------------------------------------------
-# Charts
-# --------------------------------------------------------------------------
 _PLOT_HAS_WIDTH = "width" in inspect.signature(st.plotly_chart).parameters
 
 
@@ -676,23 +892,53 @@ def show(fig, key):
 
 def tidy(fig, title, height=380):
     fig.update_layout(
-        title=dict(text=title, x=0, xanchor="left", y=0.98, yanchor="top",
-                   yref="container", font=dict(size=14)),
+        title=dict(
+            text=title,
+            x=0,
+            xanchor="left",
+            y=0.98,
+            yanchor="top",
+            yref="container",
+            font=dict(size=14, color="#f4f0e6"),
+        ),
         height=height,
-        margin=dict(l=10, r=10, t=88, b=10),
-        legend=dict(orientation="h", x=0, xanchor="left", y=1.0, yanchor="bottom",
-                    title=None, font=dict(size=11)),
-        hoverlabel=dict(font_size=12),
-        font=dict(family=FONT_PLOT, size=12),
+        margin=dict(l=6, r=6, t=82, b=8),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        legend=dict(
+            orientation="h",
+            x=0,
+            xanchor="left",
+            y=1.0,
+            yanchor="bottom",
+            title=None,
+            font=dict(size=11, color="#cbc5b9"),
+        ),
+        hoverlabel=dict(
+            bgcolor="#171916",
+            bordercolor="rgba(244,240,230,0.28)",
+            font=dict(size=12, family=FONT_PLOT, color="#f4f0e6"),
+        ),
+        font=dict(family=FONT_PLOT, size=12, color="#cbc5b9"),
     )
-    fig.update_xaxes(showgrid=False, automargin=True)
-    fig.update_yaxes(gridcolor="rgba(128,128,128,.18)", zeroline=False, automargin=True)
+    fig.update_xaxes(
+        showgrid=False,
+        automargin=True,
+        linecolor="rgba(244,240,230,0.16)",
+        tickfont=dict(color="#928d82"),
+    )
+    fig.update_yaxes(
+        gridcolor="rgba(244,240,230,0.09)",
+        zeroline=False,
+        automargin=True,
+        tickfont=dict(color="#928d82"),
+    )
     return fig
 
 
-
 FIRE_CMAP = colors.LinearSegmentedColormap.from_list(
-    "fire_years", [(0.0, "#6d5aa8"), (0.5, "#3a4541"), (0.78, "#d9622b"), (1.0, "#ffb066")])
+    "fire_years", [(0.0, "#6b57a6"), (0.5, "#363b34"), (0.78, "#dc6027"), (1.0, "#ffb469")]
+)
 
 
 def stripe_color(ratio):
@@ -700,84 +946,157 @@ def stripe_color(ratio):
     return colors.to_hex(FIRE_CMAP(float(np.clip(t, 0.0, 1.0))))
 
 
-def render_stripes(vs):
+def render_stripes(vs, title="Every year at a glance", active_year=None):
     cells = []
     for v in vs:
-        bg = stripe_color(v["ratio"]) if v["ratio"] is not None else "#262d2b"
+        bg = stripe_color(v["ratio"]) if v["ratio"] is not None else "#21241f"
         tip = escape(f"{v['year']}: {v['headline']}. {v['short']}", quote=True)
-        cells.append(f'<div class="stripe" title="{tip}" style="background:{bg}"></div>')
+        cls = "stripe active" if (active_year is not None and v["year"] == active_year) else "stripe"
+        cells.append(f'<div class="{cls}" title="{tip}" style="background:{bg}"></div>')
+
+    swatches = "".join(
+        f'<span style="background:{stripe_color(r)}"></span>'
+        for r in (0.45, 0.72, 1.0, 1.4, 2.1)
+    )
+    mid_html = f"<span>{vs[len(vs) // 2]['year']}</span>" if len(vs) >= 8 else ""
     st.markdown(
+        f'<div class="stripes-head">'
+        f'<span class="stripes-title">{escape(title)}</span>'
+        f'<span class="stripes-key"><span>Quieter</span>'
+        f'<span class="stripes-swatches">{swatches}</span>'
+        f'<span>Heavier</span></span></div>'
         f'<div class="stripes">{"".join(cells)}</div>'
-        f'<div class="stripe-axis"><span>{vs[0]["year"]}</span><span>{vs[-1]["year"]}</span></div>',
+        f'<div class="stripe-axis"><span>{vs[0]["year"]}</span>{mid_html}<span>{vs[-1]["year"]}</span></div>',
         unsafe_allow_html=True,
     )
 
 
 @st.cache_data
 def to_csv(key, _df):
-    out = _df.drop(columns=["year", "month", "ym"], errors="ignore").copy()
+    out = _df.drop(columns=["year", "month", "ym", "local_hour"], errors="ignore").copy()
     out["acq_date"] = out["acq_date"].dt.strftime("%Y-%m-%d")
     out = out.rename(columns={"weight": "viirs_equiv_weight"})
     return out.to_csv(index=False).encode()
 
 
-# --------------------------------------------------------------------------
-# Map layers
-# --------------------------------------------------------------------------
 ESRI = "https://server.arcgisonline.com/ArcGIS/rest/services"
 TILES = {
-    "Dark": dict(tiles=f"{ESRI}/Canvas/World_Dark_Gray_Base/MapServer/tile/{{z}}/{{y}}/{{x}}",
-                 attr="Tiles © Esri — Esri, HERE, Garmin, © OpenStreetMap contributors"),
-    "Light": dict(tiles=f"{ESRI}/Canvas/World_Light_Gray_Base/MapServer/tile/{{z}}/{{y}}/{{x}}",
-                  attr="Tiles © Esri — Esri, HERE, Garmin, © OpenStreetMap contributors"),
+    "Dark": dict(
+        tiles=f"{ESRI}/Canvas/World_Dark_Gray_Base/MapServer/tile/{{z}}/{{y}}/{{x}}",
+        attr="Tiles © Esri — Esri, HERE, Garmin, © OpenStreetMap contributors",
+    ),
+    "Light": dict(
+        tiles=f"{ESRI}/Canvas/World_Light_Gray_Base/MapServer/tile/{{z}}/{{y}}/{{x}}",
+        attr="Tiles © Esri — Esri, HERE, Garmin, © OpenStreetMap contributors",
+    ),
     "Streets": dict(tiles="OpenStreetMap", attr="© OpenStreetMap contributors"),
-    "Satellite": dict(tiles=f"{ESRI}/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}",
-                      attr="Tiles © Esri — Maxar, Earthstar Geographics"),
+    "Satellite": dict(
+        tiles=f"{ESRI}/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}",
+        attr="Tiles © Esri — Maxar, Earthstar Geographics",
+    ),
     "Blank (offline)": None,
 }
 
+MAP_LEGEND_STYLE = (
+    "position:fixed;bottom:24px;left:12px;z-index:9999;"
+    "background:rgba(12,13,11,0.92);backdrop-filter:blur(6px);"
+    "border:1px solid rgba(244,240,230,0.22);color:#f4f0e6;"
+    "padding:7px 11px;border-radius:3px;"
+    "font:11.5px/1.4 'JetBrains Mono',ui-monospace,monospace;"
+    "box-shadow:0 8px 22px rgba(0,0,0,0.45);"
+)
+
 
 def base_map(style: str) -> folium.Map:
-    m = folium.Map(location=[20, 0], zoom_start=2, control_scale=True, prefer_canvas=True,
-                   tiles=None, min_zoom=2, max_zoom=16)
+    m = folium.Map(
+        location=[18, 12],
+        zoom_start=2,
+        control_scale=True,
+        prefer_canvas=True,
+        tiles=None,
+        min_zoom=2,
+        max_zoom=16,
+    )
     cfg = TILES[style]
     if cfg:
         folium.TileLayer(tiles=cfg["tiles"], attr=cfg["attr"], name=style, max_zoom=16).add_to(m)
     else:
-        m.get_root().html.add_child(folium.Element(
-            "<style>.leaflet-container{background:#1c1f24!important}</style>"))
+        m.get_root().html.add_child(
+            folium.Element("<style>.leaflet-container{background:#0c0d0b!important}</style>")
+        )
     return m
 
 
-def add_points(m, sub, max_points=5000):
-    pts = sub[["latitude", "longitude", "acq_date", "sensor"]].copy()
+def add_points(m, sub, color_by="sensor", max_points=5000):
+    pts = sub[["latitude", "longitude", "acq_date", "sensor", "platform", "weight", "local_hour"]].copy()
     pts["sensor"] = pts["sensor"].astype(str)
+    pts["platform"] = pts["platform"].astype(str)
     pts = pts.dropna(subset=["latitude", "longitude"])
-    n_all = len(pts)
-    if n_all > max_points:                                     # even split per sensor
-        per = max_points // pts["sensor"].nunique()
-        pts = pd.concat(
-            [g.sample(min(len(g), per), random_state=0) for _, g in pts.groupby("sensor")]
-        )
-    dates = pts["acq_date"].dt.strftime("%Y-%m-%d").tolist()
-    layer = folium.FeatureGroup(name="Detections")
-    for la, lo, d, sn in zip(pts["latitude"], pts["longitude"], dates, pts["sensor"]):
-        col = SENSOR_COLORS.get(sn, OTHER_COLOR)
-        folium.CircleMarker(
-            location=[float(la), float(lo)], radius=3, color=col, weight=0,
-            fill=True, fill_color=col, fill_opacity=0.55, tooltip=f"{d}, {sn}",
-        ).add_to(layer)
-    layer.add_to(m)
+    if color_by == "solar":
+        pts = pts[pts["local_hour"] >= 0]
+        if pts.empty:
+            return 0, 0
+        pts["tod"] = np.where((pts["local_hour"] >= 6) & (pts["local_hour"] < 18), "Daytime (06–18h)", "Overnight (18–06h)")
 
-    present = [sn for sn in ("MODIS", "VIIRS") if sn in set(pts["sensor"])]
-    items = "".join(
-        f'<span style="color:{SENSOR_COLORS[sn]}">&#9679;</span>&nbsp;{sn}&nbsp;&nbsp;' for sn in present
-    )
-    m.get_root().html.add_child(folium.Element(
-        '<div style="position:fixed;bottom:26px;left:12px;z-index:9999;'
-        'background:rgba(18,18,20,.8);color:#e8e8e8;padding:5px 10px;'
-        f'border-radius:4px;font:12px sans-serif">{items}</div>'
-    ))
+    n_all = len(pts)
+    group_col = "tod" if color_by == "solar" else "sensor"
+    if n_all > max_points:
+        per = max(1, max_points // pts[group_col].nunique())
+        pts = pd.concat([g.sample(min(len(g), per), random_state=0) for _, g in pts.groupby(group_col)])
+
+    dates = pts["acq_date"].dt.strftime("%Y-%m-%d").tolist()
+    layer_grp = folium.FeatureGroup(name="Detections")
+
+    if color_by == "solar":
+        tod_colors = {"Daytime (06–18h)": DAY_COLOR, "Overnight (18–06h)": NIGHT_COLOR}
+        for la, lo, d, sn, lh, td in zip(
+            pts["latitude"], pts["longitude"], dates, pts["sensor"], pts["local_hour"], pts["tod"]
+        ):
+            col = tod_colors[td]
+            folium.CircleMarker(
+                location=[float(la), float(lo)],
+                radius=3,
+                color=col,
+                weight=0,
+                fill=True,
+                fill_color=col,
+                fill_opacity=0.68,
+                tooltip=f"{d} · ~{int(lh):02d}:00 solar ({sn})",
+            ).add_to(layer_grp)
+        layer_grp.add_to(m)
+        items = "&nbsp;&nbsp;".join(
+            f'<span style="display:inline-flex;align-items:center;gap:5px;">'
+            f'<span style="width:8px;height:8px;border-radius:50%;background:{c};display:inline-block;"></span>'
+            f"{lbl}</span>"
+            for lbl, c in tod_colors.items()
+        )
+        m.get_root().html.add_child(folium.Element(f'<div style="{MAP_LEGEND_STYLE}">{items}</div>'))
+    else:
+        for la, lo, d, sn, pl, wt in zip(
+            pts["latitude"], pts["longitude"], dates, pts["sensor"], pts["platform"], pts["weight"]
+        ):
+            col = SENSOR_COLORS.get(sn, OTHER_COLOR)
+            plat_txt = f" ({pl})" if pl and pl != "UNKNOWN" else ""
+            folium.CircleMarker(
+                location=[float(la), float(lo)],
+                radius=3,
+                color=col,
+                weight=0,
+                fill=True,
+                fill_color=col,
+                fill_opacity=0.65,
+                tooltip=f"{d} · {sn}{plat_txt} · {wt:.2f} eq.",
+            ).add_to(layer_grp)
+        layer_grp.add_to(m)
+        present = [sn for sn in ("MODIS", "VIIRS") if sn in set(pts["sensor"])] or sorted(set(pts["sensor"]))
+        items = "&nbsp;&nbsp;".join(
+            f'<span style="display:inline-flex;align-items:center;gap:5px;">'
+            f'<span style="width:8px;height:8px;border-radius:50%;background:{SENSOR_COLORS.get(sn, OTHER_COLOR)};display:inline-block;"></span>'
+            f"{sn}</span>"
+            for sn in present
+        )
+        m.get_root().html.add_child(folium.Element(f'<div style="{MAP_LEGEND_STYLE}">{items}</div>'))
+
     return n_all, len(pts)
 
 
@@ -792,10 +1111,12 @@ def _grid(df, c, value_col="weight", denom=1.0):
 
 def _cell_feature(la, lo, h, props):
     return {
-        "type": "Feature", "properties": props,
-        "geometry": {"type": "Polygon", "coordinates": [[
-            [lo - h, la - h], [lo + h, la - h], [lo + h, la + h], [lo - h, la + h], [lo - h, la - h]
-        ]]},
+        "type": "Feature",
+        "properties": props,
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[lo - h, la - h], [lo + h, la - h], [lo + h, la + h], [lo - h, la + h], [lo - h, la - h]]],
+        },
     }
 
 
@@ -810,20 +1131,36 @@ def add_density(m, sub):
     norm = colors.LogNorm(vmin=vmin, vmax=vmax, clip=True)
     cmap = colormaps["YlOrRd"]
     feats = [
-        _cell_feature(la, lo, cell / 2,
-                      {"count": round(float(w)), "color": colors.to_hex(cmap(0.2 + 0.8 * norm(w)))})
+        _cell_feature(
+            la, lo, cell / 2,
+            {"count": round(float(w)), "color": colors.to_hex(cmap(0.2 + 0.8 * norm(w)))},
+        )
         for la, lo, w in zip(grid["glat"], grid["glon"], grid["w"])
     ]
     folium.GeoJson(
         {"type": "FeatureCollection", "features": feats},
-        style_function=lambda f: {"fillColor": f["properties"]["color"], "fillOpacity": 0.65, "weight": 0},
+        style_function=lambda f: {"fillColor": f["properties"]["color"], "fillOpacity": 0.70, "weight": 0},
         tooltip=folium.GeoJsonTooltip(fields=["count"], aliases=["Detections (VIIRS-eq.)"]),
     ).add_to(m)
-    return cell, int(round(grid["w"].max()))
+
+    max_val = int(round(grid["w"].max()))
+    ramp_cols = [colors.to_hex(cmap(t)) for t in np.linspace(0.2, 1.0, 6)]
+    grad = f"linear-gradient(90deg, {', '.join(ramp_cols)})"
+    m.get_root().html.add_child(
+        folium.Element(
+            f'<div style="{MAP_LEGEND_STYLE}">'
+            f'<div style="color:#928d82;font-size:10px;margin-bottom:4px;">VIIRS-EQ. DENSITY ({cell:g}° CELL)</div>'
+            f'<div style="display:flex;align-items:center;gap:8px;">'
+            f"<span>Low</span>"
+            f'<span style="width:92px;height:7px;border-radius:2px;background:{grad};display:inline-block;"></span>'
+            f"<span>{max_val:,}</span>"
+            f"</div></div>"
+        )
+    )
+    return cell, max_val
 
 
 def add_change(m, sub, recent, base):
-    """Mean annual detections per cell: recent years minus the earlier baseline."""
     cell = 0.1
     while True:
         gr = _grid(sub[sub["year"].isin(recent)], cell, denom=len(recent))
@@ -835,124 +1172,569 @@ def add_change(m, sub, recent, base):
     mg["d"] = mg["w_r"] - mg["w_b"]
     lim = max(float(np.percentile(np.abs(mg["d"]), 98)), 0.5)
     norm = colors.Normalize(vmin=-lim, vmax=lim, clip=True)
-    cmap = colormaps["PuOr_r"]                                  # purple = fewer, orange = more
+    # Purple = fewer fires than baseline, orange = more
+    cmap = colormaps["PuOr_r"]
     mg = mg[mg["d"].abs() >= 0.05 * lim]
     feats = [
-        _cell_feature(la, lo, cell / 2, {
-            "change": round(float(d), 1), "recent": round(float(r), 1), "baseline": round(float(b), 1),
-            "color": colors.to_hex(cmap(norm(d)))})
+        _cell_feature(
+            la, lo, cell / 2,
+            {
+                "change": round(float(d), 1),
+                "recent": round(float(r), 1),
+                "baseline": round(float(b), 1),
+                "color": colors.to_hex(cmap(norm(d))),
+            },
+        )
         for la, lo, d, r, b in zip(mg["glat"], mg["glon"], mg["d"], mg["w_r"], mg["w_b"])
     ]
     folium.GeoJson(
         {"type": "FeatureCollection", "features": feats},
-        style_function=lambda f: {"fillColor": f["properties"]["color"], "fillOpacity": 0.7, "weight": 0},
+        style_function=lambda f: {"fillColor": f["properties"]["color"], "fillOpacity": 0.72, "weight": 0},
         tooltip=folium.GeoJsonTooltip(
             fields=["change", "recent", "baseline"],
-            aliases=["Change / yr", "Recent / yr", "Baseline / yr"]),
+            aliases=["Change / yr", "Recent / yr", "Baseline / yr"],
+        ),
     ).add_to(m)
+
+    ramp_cols = [colors.to_hex(cmap(t)) for t in np.linspace(0.05, 0.95, 7)]
+    grad = f"linear-gradient(90deg, {', '.join(ramp_cols)})"
+    m.get_root().html.add_child(
+        folium.Element(
+            f'<div style="{MAP_LEGEND_STYLE}">'
+            f'<div style="color:#928d82;font-size:10px;margin-bottom:4px;">ANNUAL CHANGE VS BASELINE</div>'
+            f'<div style="display:flex;align-items:center;gap:8px;">'
+            f"<span>−{lim:,.0f}</span>"
+            f'<span style="width:92px;height:7px;border-radius:2px;background:{grad};display:inline-block;"></span>'
+            f"<span>+{lim:,.0f}/yr</span>"
+            f"</div></div>"
+        )
+    )
     return cell, lim
 
 
 ATTRIBUTION_FIX = (
-    "<style>.leaflet-control-attribution{background:rgba(255,255,255,.85)!important;"
-    "color:#333!important;font-size:10px}.leaflet-control-attribution a{color:#06c!important}</style>"
+    "<style>.leaflet-control-attribution{background:rgba(12,13,11,.85)!important;"
+    "color:#928d82!important;font-size:10px;border-top-left-radius:3px}"
+    ".leaflet-control-attribution a{color:#8fb369!important}</style>"
 )
 
 PAGE_CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Public+Sans:wght@400;500;600;700&display=swap');
-:root {--lichen: #a8c08a; --line: rgba(190,205,195,.18); --muted: #98a39d;}
-html, body, .stApp, .stApp p, .stApp label, .stApp li, .stApp h1, .stApp h2, .stApp h3, .stApp h4,
-.stApp button, .stApp input, .stApp textarea, .stApp [data-baseweb="tab"] {font-family: __FONT__;}
-.block-container {padding-top: 4.4rem; max-width: 1480px;}
-footer, #MainMenu, [data-testid="stAppDeployButton"] {visibility: hidden;}
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
 
-.masthead h1 {font-size: 2.1rem; font-weight: 700; letter-spacing: -0.025em; line-height: 1.1;
-              margin: 0; padding: 0;}
-.masthead p {color: var(--muted); font-size: 1rem; line-height: 1.5; max-width: 60ch;
-             margin: .45rem 0 1.4rem 0;}
+:root {
+  --bg: #0c0d0b;
+  --sidebar: #111310;
+  --surface: #151714;
+  --surface-2: #1c1f1a;
+  --ink: #f4f0e6;
+  --ink-soft: #cbc5b9;
+  --muted: #928d82;
+  --line: rgba(244, 240, 230, 0.11);
+  --line-strong: rgba(244, 240, 230, 0.26);
+  --sage: #8fb369;
+  --ember: #f06428;
+  --amber: #e0a938;
+  --slate: #6892b5;
+  --violet: #8976bd;
+}
 
-[data-testid="stSidebar"] {border-right: 1px solid var(--line);}
-.kicker {font-size: .84rem; font-weight: 600; margin: 1.35rem 0 .35rem 0;}
+html, body, .stApp {
+  background-color: var(--bg);
+  color: var(--ink);
+}
 
-[data-testid="stMetric"] {border-left: 2px solid var(--line); padding: .1rem 0 .15rem .9rem;}
-[data-testid="stMetricLabel"] p {font-size: .82rem; color: var(--muted); white-space: normal;}
-[data-testid="stMetricDelta"] {font-size: .8rem;}
-[data-testid="stMetricValue"] {font-size: 1.4rem; font-weight: 600; letter-spacing: -0.015em;
-                               font-variant-numeric: tabular-nums;}
+.stApp, .stApp p, .stApp label, .stApp li, .stApp h2, .stApp h3, .stApp h4,
+.stApp button, .stApp input, .stApp textarea, .stApp [data-baseweb="tab"] {
+  font-family: __UI__;
+}
 
-.stTabs [data-baseweb="tab-list"] {gap: 1.6rem; border-bottom: 1px solid var(--line);}
-.stTabs [data-baseweb="tab"] {padding: .55rem 0; background: transparent;}
-.stTabs [data-baseweb="tab-highlight"] {background-color: var(--lichen);}
+[data-testid="stHeader"] {
+  background: transparent;
+}
 
-.callout {border-left: 4px solid; padding: .8rem 1.1rem; border-radius: 2px;
-          margin: .2rem 0 1.3rem 0; font-size: 1.02rem; line-height: 1.6; max-width: 90ch;}
-.callout.low, .callout.normal {border-color: #6f94b3; background: rgba(111,148,179,.09);}
-.callout.elevated {border-color: #d9a441; background: rgba(217,164,65,.09);}
-.callout.high {border-color: #ef6c33; background: rgba(239,108,51,.11);}
+.block-container {
+  padding-top: 1.85rem;
+  padding-bottom: 3rem;
+  max-width: 1500px;
+}
 
-.hero {border-left: 4px solid; padding: .15rem 0 .15rem 1.1rem; margin: .4rem 0 1.3rem 0;
-       animation: rise .6s ease-out;}
-.hero.low, .hero.normal {border-color: #6f94b3;}
-.hero.elevated {border-color: #d9a441;}
-.hero.high {border-color: #ef6c33;}
-.hero-line {font-size: 1.7rem; font-weight: 650; letter-spacing: -0.02em; line-height: 1.2;}
-.hero-sub {color: var(--muted); font-size: .94rem; line-height: 1.55; margin-top: .55rem;}
-@keyframes rise {from {opacity: 0; transform: translateY(8px);} to {opacity: 1; transform: none;}}
-@media (prefers-reduced-motion: reduce) {.hero {animation: none;}}
-.hero.much_more {border-color: #ef6c33;}
-.hero.more {border-color: #d9a441;}
-.hero.typical {border-color: #6f94b3;}
-.hero.less {border-color: #8a78c0;}
-.hero.much_less {border-color: #6d5aa8;}
-.hero.partial {border-color: #59635f;}
-.lede {font-size: 1.08rem; line-height: 1.65; max-width: 78ch; margin: .2rem 0 1.3rem 0;}
-.stripes {display: flex; height: 4.6rem; gap: 1px; border-radius: 3px; overflow: hidden; margin: .5rem 0 .25rem 0;}
-.stripe {flex: 1; transition: filter .15s;}
-.stripe:hover {filter: brightness(1.35);}
-.stripe-axis {display: flex; justify-content: space-between; color: var(--muted); font-size: .78rem;}
-.yeargrid {display: grid; grid-template-columns: repeat(auto-fill, minmax(165px, 1fr)); gap: 8px; margin: 1.1rem 0 .5rem 0;}
-.yearcard {border-top: 3px solid var(--line); background: rgba(190,205,195,.05); padding: .6rem .75rem .7rem; border-radius: 2px;}
-.yearcard .y {font-size: 1.15rem; font-weight: 650; font-variant-numeric: tabular-nums;}
-.yearcard .h {font-size: .84rem; line-height: 1.35; margin-top: .15rem;}
-.yearcard .s {font-size: .78rem; color: var(--muted); margin-top: .3rem;}
-.yearcard.much_more {border-color: #ef6c33;}
-.yearcard.more {border-color: #d9a441;}
-.yearcard.typical {border-color: #6f94b3;}
-.yearcard.less {border-color: #8a78c0;}
-.yearcard.much_less {border-color: #6d5aa8;}
-.yearcard.partial {border-color: #59635f; opacity: .75;}
-.ribbon-title {font-size: .9rem; font-weight: 600; margin: 1.2rem 0 .4rem 0;}
-.ribbon {display: grid; grid-template-columns: repeat(6, 1fr); gap: 3px;}
-.ribbon-cell {height: 2.3rem; border-radius: 2px; padding: .2rem .4rem;
-              display: flex; align-items: flex-end; font-size: .72rem;}
-.step {border-top: 2px solid var(--lichen); padding-top: .7rem;}
-.step b {font-size: 1.02rem;}
-.step p {color: var(--muted); font-size: .92rem; line-height: 1.55; margin: .3rem 0 0 0;}
+footer, #MainMenu, [data-testid="stAppDeployButton"] {
+  visibility: hidden;
+}
 
-.note {font-size: .88rem; color: var(--muted); line-height: 1.55;}
-.credits {margin-top: 2.2rem; padding-top: .8rem; border-top: 1px solid var(--line);
-          color: var(--muted); font-size: .8rem; line-height: 1.6;}
+/* Cartographic masthead with subtle orbital graticule lines */
+.masthead {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 1rem 2rem;
+  border-bottom: 1px solid var(--line-strong);
+  padding: .35rem 0 1.15rem 0;
+  margin-bottom: 1.25rem;
+  background-image:
+    linear-gradient(to right, rgba(244, 240, 230, 0.03) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(244, 240, 230, 0.03) 1px, transparent 1px);
+  background-size: 36px 36px;
+}
+.masthead h1 {
+  font-family: __DISPLAY__;
+  font-size: 2.38rem;
+  font-weight: 600;
+  letter-spacing: -0.025em;
+  line-height: 1.05;
+  color: var(--ink);
+  margin: 0;
+  padding: 0;
+}
+.masthead .sub {
+  color: var(--ink-soft);
+  font-size: .95rem;
+  line-height: 1.52;
+  max-width: 62ch;
+  margin: .42rem 0 0 0;
+}
+.telemetry {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .55rem 1.25rem;
+  font-family: __MONO__;
+  font-size: .74rem;
+  color: var(--muted);
+  padding: .5rem .8rem;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--ember);
+  border-radius: 3px;
+}
+.telemetry b {
+  color: var(--ink);
+  font-weight: 500;
+}
 
-[data-testid="stCustomComponentV1"] iframe {border: 1px solid var(--line); border-radius: 3px;}
-.stDownloadButton button, .stButton button {border-radius: 4px; border: 1px solid var(--line);}
+/* Sidebar */
+[data-testid="stSidebar"] {
+  background-color: var(--sidebar);
+  border-right: 1px solid var(--line);
+}
+.sb-label {
+  font-family: __MONO__;
+  font-size: .70rem;
+  font-weight: 600;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--muted);
+  border-top: 1px solid var(--line);
+  padding-top: .8rem;
+  margin: 1rem 0 .4rem 0;
+}
+.sb-label.top {
+  border-top: none;
+  padding-top: 0;
+  margin-top: .1rem;
+}
+.aoi-box {
+  font-family: __MONO__;
+  font-size: .73rem;
+  line-height: 1.5;
+  color: var(--ink-soft);
+  border-left: 2px solid #4ecdc4;
+  padding: .2rem 0 .2rem .65rem;
+  margin-top: .5rem;
+}
+
+/* Metrics */
+[data-testid="stMetric"] {
+  background: transparent;
+  border: none;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  padding: .52rem 0 .32rem 0;
+  margin-bottom: .25rem;
+}
+[data-testid="stMetricLabel"] p {
+  font-size: .78rem;
+  color: var(--muted);
+  white-space: normal;
+  line-height: 1.3;
+}
+[data-testid="stMetricDelta"] {
+  font-family: __MONO__;
+  font-size: .74rem;
+}
+[data-testid="stMetricValue"] {
+  font-family: __MONO__;
+  font-size: 1.32rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Tabs */
+.stTabs [data-baseweb="tab-list"] {
+  gap: 1.65rem;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: .75rem;
+}
+.stTabs [data-baseweb="tab"] {
+  padding: .5rem 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: .91rem;
+  font-weight: 500;
+}
+.stTabs [aria-selected="true"] {
+  color: var(--ink) !important;
+  font-weight: 600;
+}
+.stTabs [data-baseweb="tab-highlight"] {
+  background-color: var(--ember);
+  height: 2px;
+}
+
+/* Verdict statement */
+.verdict {
+  border-left: 3px solid var(--slate);
+  padding: .15rem 0 .2rem .95rem;
+  margin: .35rem 0 1rem 0;
+  animation: fadeSlide .35s ease-out;
+}
+@keyframes fadeSlide {
+  from {opacity: 0; transform: translateY(5px);}
+  to {opacity: 1; transform: none;}
+}
+@media (prefers-reduced-motion: reduce) {
+  .verdict {animation: none;}
+}
+.verdict-meta {
+  font-family: __MONO__;
+  font-size: .72rem;
+  color: var(--muted);
+  margin-bottom: .25rem;
+}
+.verdict-head {
+  font-family: __DISPLAY__;
+  font-size: 1.58rem;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  line-height: 1.18;
+  color: var(--ink);
+}
+.verdict-body {
+  color: var(--ink-soft);
+  font-size: .91rem;
+  line-height: 1.56;
+  margin-top: .38rem;
+}
+.verdict.low, .verdict.normal, .verdict.typical {border-left-color: #6892b5;}
+.verdict.low .verdict-meta, .verdict.normal .verdict-meta, .verdict.typical .verdict-meta {color: #8cb4d4;}
+.verdict.elevated, .verdict.more {border-left-color: #e0a938;}
+.verdict.elevated .verdict-meta, .verdict.more .verdict-meta {color: #ecc063;}
+.verdict.high, .verdict.much_more {border-left-color: #f06428;}
+.verdict.high .verdict-meta, .verdict.much_more .verdict-meta {color: #f48656;}
+.verdict.less {border-left-color: #8976bd;}
+.verdict.less .verdict-meta {color: #a695d4;}
+.verdict.much_less {border-left-color: #6b57a6;}
+.verdict.much_less .verdict-meta {color: #9683cc;}
+.verdict.partial {border-left-color: #585c55;}
+
+/* Field Notes cards */
+.notes-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
+  margin: .45rem 0 1.15rem 0;
+}
+.fnote {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--sage);
+  border-radius: 3px;
+  padding: .68rem .85rem .72rem;
+  transition: background-color .14s;
+}
+.fnote:hover {
+  background: var(--surface-2);
+}
+.fnote.regime {border-left-color: var(--ember);}
+.fnote.clock {border-left-color: var(--amber);}
+.fnote.record {border-left-color: var(--slate);}
+.fnote.orbital {border-left-color: var(--sage);}
+.fnote-tag {
+  font-family: __MONO__;
+  font-size: .68rem;
+  font-weight: 600;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: .22rem;
+}
+.fnote.regime .fnote-tag {color: #f48656;}
+.fnote.clock .fnote-tag {color: #ecc063;}
+.fnote.record .fnote-tag {color: #8cb4d4;}
+.fnote.orbital .fnote-tag {color: #a8c786;}
+.fnote-head {
+  font-size: .92rem;
+  font-weight: 600;
+  color: var(--ink);
+  line-height: 1.32;
+}
+.fnote-body {
+  font-size: .83rem;
+  line-height: 1.52;
+  color: var(--ink-soft);
+  margin-top: .28rem;
+}
+
+.lede {
+  font-size: 1.03rem;
+  line-height: 1.65;
+  color: var(--ink-soft);
+  max-width: 78ch;
+  margin: .2rem 0 1.1rem 0;
+}
+
+/* Annual fire stripes */
+.stripes-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: .5rem;
+  margin: .1rem 0 .35rem 0;
+}
+.stripes-title {
+  font-size: .87rem;
+  font-weight: 600;
+  color: var(--ink);
+}
+.stripes-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: __MONO__;
+  font-size: .70rem;
+  color: var(--muted);
+}
+.stripes-swatches {
+  display: inline-flex;
+  gap: 2px;
+}
+.stripes-swatches span {
+  width: 12px;
+  height: 8px;
+  border-radius: 1px;
+  display: inline-block;
+}
+.stripes {
+  display: flex;
+  height: 3.9rem;
+  gap: 2px;
+  padding: 2px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  margin: 0 0 .25rem 0;
+}
+.stripe {
+  flex: 1;
+  border-radius: 1px;
+  transition: filter .14s, transform .14s;
+}
+.stripe:hover {
+  filter: brightness(1.28);
+  transform: scaleY(1.05);
+}
+.stripe.active {
+  outline: 2px solid var(--ink);
+  outline-offset: 1px;
+  z-index: 2;
+}
+.stripe-axis {
+  display: flex;
+  justify-content: space-between;
+  font-family: __MONO__;
+  color: var(--muted);
+  font-size: .73rem;
+  margin-bottom: .35rem;
+}
+
+/* Year cards */
+.yeargrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  gap: 8px;
+  margin: 1.1rem 0 .5rem 0;
+}
+.yearcard {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  border: 1px solid var(--line);
+  border-top: 3px solid var(--line);
+  background: var(--surface);
+  padding: .62rem .75rem .68rem;
+  border-radius: 3px;
+  transition: background-color .14s;
+}
+.yearcard:hover {
+  background: var(--surface-2);
+}
+.yearcard.active {
+  background: var(--surface-2);
+  border-color: var(--line-strong);
+  box-shadow: inset 0 0 0 1px rgba(244, 240, 230, 0.24);
+}
+.yearcard .y {
+  font-family: __MONO__;
+  font-size: 1.06rem;
+  font-weight: 600;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+.yearcard .h {
+  font-size: .82rem;
+  line-height: 1.35;
+  color: var(--ink-soft);
+  margin-top: .2rem;
+}
+.yearcard .s {
+  font-family: __MONO__;
+  font-size: .72rem;
+  color: var(--muted);
+  margin-top: .42rem;
+  padding-top: .32rem;
+  border-top: 1px solid var(--line);
+}
+.yearcard.much_more {border-top-color: #f06428;}
+.yearcard.more {border-top-color: #e0a938;}
+.yearcard.typical {border-top-color: #6892b5;}
+.yearcard.less {border-top-color: #8976bd;}
+.yearcard.much_less {border-top-color: #6b57a6;}
+.yearcard.partial {border-top-color: #585c55; opacity: .74;}
+
+/* Month strip */
+.ribbon-title {
+  font-size: .87rem;
+  font-weight: 600;
+  color: var(--ink);
+  margin: .95rem 0 .4rem 0;
+}
+.ribbon {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 4px;
+}
+.ribbon-cell {
+  height: 2.3rem;
+  border-radius: 2px;
+  padding: .22rem .4rem;
+  display: flex;
+  align-items: flex-end;
+  font-family: __MONO__;
+  font-size: .71rem;
+  font-weight: 500;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* Harmonization method notes */
+.method-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 14px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  padding: .9rem 0;
+  margin: .2rem 0 1rem 0;
+}
+.method-item b {
+  font-size: .92rem;
+  color: var(--ink);
+}
+.method-item p {
+  color: var(--ink-soft);
+  font-size: .86rem;
+  line-height: 1.52;
+  margin: .25rem 0 0 0;
+}
+
+.region-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: .4rem;
+  padding-bottom: .4rem;
+  margin-bottom: .3rem;
+  border-bottom: 1px solid var(--line);
+}
+.region-head .title {
+  font-family: __DISPLAY__;
+  font-size: 1.28rem;
+  font-weight: 600;
+  color: var(--ink);
+}
+.region-head .span {
+  font-family: __MONO__;
+  font-size: .74rem;
+  color: var(--muted);
+}
+
+.landing-caption {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: .5rem 1.5rem;
+  margin: .75rem 0 .5rem 0;
+  color: var(--ink-soft);
+  font-size: .93rem;
+}
+
+.note {
+  font-size: .84rem;
+  color: var(--muted);
+  line-height: 1.55;
+}
+.credits {
+  margin-top: 2.3rem;
+  padding-top: .8rem;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: .78rem;
+  line-height: 1.6;
+}
+
+[data-testid="stCustomComponentV1"] iframe {
+  border: 1px solid var(--line);
+  border-radius: 3px;
+}
+.stDownloadButton button, .stButton button {
+  border-radius: 3px;
+  border: 1px solid var(--line-strong);
+  background-color: var(--surface);
+  color: var(--ink);
+  font-size: .85rem;
+}
+.stDownloadButton button:hover, .stButton button:hover {
+  border-color: var(--ember);
+  color: var(--ember);
+}
 </style>
 """
 
-# --------------------------------------------------------------------------
-# Page
-# --------------------------------------------------------------------------
-st.markdown(PAGE_CSS.replace("__FONT__", FONT_STACK), unsafe_allow_html=True)
 st.markdown(
-    '<div class="masthead"><h1>Fire Activity Explorer</h1>'
-    "<p>Satellites have counted fire hotspots since 2000, but with two different instruments. "
-    "Here MODIS and VIIRS are joined into one record, so you can compare any month, in any area, "
-    "with everything that came before it.</p></div>",
+    PAGE_CSS.replace("__UI__", FONT_UI)
+    .replace("__DISPLAY__", FONT_DISPLAY)
+    .replace("__MONO__", FONT_MONO),
     unsafe_allow_html=True,
 )
 
 try:
-    regions, canon = load_regions()
+    regions, canon, geoms_wkb = load_regions()
 except Exception as e:
     st.error(f"Could not load country boundaries from {NE_PATH}: {e}")
     st.stop()
@@ -965,83 +1747,96 @@ def has_data(key: str) -> bool:
 
 
 def region_label(key: str) -> str:
-    return key.title() + ("  (data loaded)" if has_data(key) else "")
+    return key.title() + ("  · loaded" if has_data(key) else "")
 
 
-# ---- Sidebar --------------------------------------------------------------
+# Sidebar controls
 sb = st.sidebar
-sb.markdown('<div class="kicker">Region</div>', unsafe_allow_html=True)
+sb.markdown('<div class="sb-label top">Region</div>', unsafe_allow_html=True)
 match = sb.selectbox(
-    "Region", sorted(regions), index=None, format_func=region_label,
-    placeholder="Search, e.g. Egypt", label_visibility="collapsed", key="region_pick",
+    "Region",
+    sorted(regions),
+    index=None,
+    format_func=region_label,
+    placeholder="Type any country or territory…",
+    label_visibility="collapsed",
+    key="region_pick",
 )
 bbox = regions[match] if match else None
 match_title = match.title() if match else ""
 
-sb.markdown('<div class="kicker">Area of interest</div>', unsafe_allow_html=True)
-aoi_mode = sb.radio("Area of interest", ["Whole region", "Draw on map", "Coordinates"],
-                    label_visibility="collapsed")
+sb.markdown('<div class="sb-label">Area of interest</div>', unsafe_allow_html=True)
+aoi_mode = sb.radio(
+    "Area of interest",
+    ["Whole region", "Draw on map", "Coordinates"],
+    label_visibility="collapsed",
+)
 aoi_poly = None
 if match and aoi_mode == "Draw on map":
     saved = st.session_state.get("aoi_draw")
     if saved and saved["region"] == match:
         aoi_poly = shapely_wkt.loads(saved["wkt"])
-    sb.caption("Use the polygon, rectangle or circle tool at the top left of the map.")
+    sb.caption("Use the polygon, rectangle, or circle tool at the top left of the map.")
     sb.button("Clear drawn area", on_click=lambda: st.session_state.pop("aoi_draw", None))
 elif match and aoi_mode == "Coordinates":
-    kind = sb.radio("Shape", ["Bounding box", "Point and radius"], horizontal=True,
-                    label_visibility="collapsed")
+    kind = sb.radio("Shape", ["Bounding box", "Point and radius"], horizontal=True, label_visibility="collapsed")
     if kind == "Bounding box":
         c1, c2 = sb.columns(2)
-        lat0 = c1.number_input("South latitude", -90.0, 90.0, round(bbox[0], 3), 0.1,
-                               format="%.3f", key=f"s_{match}")
-        lat1 = c2.number_input("North latitude", -90.0, 90.0, round(bbox[1], 3), 0.1,
-                               format="%.3f", key=f"n_{match}")
-        lon0 = c1.number_input("West longitude", -180.0, 180.0, round(bbox[2], 3), 0.1,
-                               format="%.3f", key=f"w_{match}")
-        lon1 = c2.number_input("East longitude", -180.0, 180.0, round(bbox[3], 3), 0.1,
-                               format="%.3f", key=f"e_{match}")
+        lat0 = c1.number_input("South latitude", -90.0, 90.0, round(bbox[0], 3), 0.1, format="%.3f", key=f"s_{match}")
+        lat1 = c2.number_input("North latitude", -90.0, 90.0, round(bbox[1], 3), 0.1, format="%.3f", key=f"n_{match}")
+        lon0 = c1.number_input("West longitude", -180.0, 180.0, round(bbox[2], 3), 0.1, format="%.3f", key=f"w_{match}")
+        lon1 = c2.number_input("East longitude", -180.0, 180.0, round(bbox[3], 3), 0.1, format="%.3f", key=f"e_{match}")
         if lat1 > lat0 and lon1 > lon0:
             aoi_poly = box(lon0, lat0, lon1, lat1)
         else:
             sb.warning("North must be above south, and east right of west.")
     else:
         c1, c2 = sb.columns(2)
-        clat = c1.number_input("Latitude", -90.0, 90.0, round((bbox[0] + bbox[1]) / 2, 3), 0.1,
-                               format="%.3f", key=f"clat_{match}")
-        clon = c2.number_input("Longitude", -180.0, 180.0, round((bbox[2] + bbox[3]) / 2, 3), 0.1,
-                               format="%.3f", key=f"clon_{match}")
+        clat = c1.number_input("Latitude", -90.0, 90.0, round((bbox[0] + bbox[1]) / 2, 3), 0.1, format="%.3f", key=f"clat_{match}")
+        clon = c2.number_input("Longitude", -180.0, 180.0, round((bbox[2] + bbox[3]) / 2, 3), 0.1, format="%.3f", key=f"clon_{match}")
         rad = sb.number_input("Radius (km)", 1.0, 2000.0, 50.0, 5.0, key=f"rad_{match}")
         aoi_poly = circle_polygon(clon, clat, rad * 1000.0)
 
-sb.markdown('<div class="kicker">Period</div>', unsafe_allow_html=True)
+sb.markdown('<div class="sb-label">Period</div>', unsafe_allow_html=True)
 date_box = sb.container()
-sb.markdown('<div class="kicker">Map</div>', unsafe_allow_html=True)
-layer = sb.selectbox("Map layer", ["Points", "Density grid", "Change vs baseline"],
-                     label_visibility="collapsed")
+sb.markdown('<div class="sb-label">Map display</div>', unsafe_allow_html=True)
+layer = sb.selectbox(
+    "Map layer",
+    ["Points", "Density grid", "Change vs baseline", "Day vs night (solar)"],
+    label_visibility="collapsed",
+)
 style = sb.selectbox("Base map", list(TILES), label_visibility="collapsed")
-sb.markdown('<div class="kicker">Data cleaning</div>', unsafe_allow_html=True)
+sb.markdown('<div class="sb-label">Data cleaning</div>', unsafe_allow_html=True)
 with sb.expander("Quality and harmonization"):
     drop_low = st.checkbox(
-        "Drop low-confidence detections", True,
-        help="Removes MODIS confidence below 30 and VIIRS 'low'.")
+        "Drop low-confidence detections",
+        True,
+        help="Removes MODIS confidence below 30 and VIIRS 'low'.",
+    )
     veg_only = st.checkbox(
-        "Vegetation fires only", True,
-        help="Keeps FIRMS type 0. Removes volcanoes, gas flares and other static sources "
-             "(only applies when the file has a type column).")
+        "Vegetation fires only",
+        True,
+        help="Keeps FIRMS type 0 and drops volcanoes, gas flares, and static industrial heat sources.",
+    )
     viirs_mode = st.radio(
-        "VIIRS satellites", ["SNPP only", "All, normalized per satellite"],
-        help="SNPP has flown since 2012, so it is the most consistent reference. "
-             "NOAA-20 and NOAA-21 add overpasses that raise raw counts without more fire.")
+        "VIIRS satellites",
+        ["SNPP only", "All, normalized per satellite"],
+        help="SNPP has flown since 2012. Adding NOAA-20 and NOAA-21 increases raw overpasses without more fire.",
+    )
     scaling = st.radio(
-        "MODIS to VIIRS scaling", ["Single factor", "By calendar month"],
-        help="Monthly factors follow the seasonal difference in what each sensor sees "
-             "(VIIRS picks up many small agricultural fires MODIS misses).")
+        "MODIS to VIIRS scaling",
+        ["Single factor", "By calendar month"],
+        help="Monthly factors track seasonal differences in small agricultural fires missed by MODIS.",
+    )
     min_monthly = st.number_input(
-        "Min. detections per overlap month", 1, 500, 10,
-        help="Months below this are ignored when computing the scaling factor.")
+        "Min. detections per overlap month",
+        1,
+        500,
+        10,
+        help="Months below this threshold are skipped when estimating the scaling ratio.",
+    )
 
-# ---- Data -----------------------------------------------------------------
+# Load and filter dataset
 sub, info = None, None
 data_ready = False
 dmax = None
@@ -1050,47 +1845,97 @@ if match:
     path = find_data_file(match, canon)
     if path is None:
         st.info(
-            f"No fire data for {match_title} yet. Add `data/{slug(match, canon)}.csv` "
-            "(a FIRMS archive download) to see hotspots."
+            f"No hotspot file found for {match_title} yet. Drop a FIRMS archive file at "
+            f"`data/{slug(match, canon)}.csv` (or `.parquet`) to open its record."
         )
     else:
         try:
             hot, info = build_dataset(
-                str(path), path.stat().st_mtime, drop_low, veg_only,
+                str(path),
+                path.stat().st_mtime,
+                drop_low,
+                veg_only,
                 "snpp" if viirs_mode.startswith("SNPP") else "all",
-                scaling.startswith("By"), int(min_monthly),
+                scaling.startswith("By"),
+                int(min_monthly),
             )
         except Exception as e:
             st.error(f"Could not process {path.name}: {e}")
             st.stop()
 
         if hot.empty:
-            st.warning("No detections left after the quality filters.")
+            st.warning("No detections left after the current quality filters.")
         else:
             data_ready = True
             dmin, dmax = hot["acq_date"].min().date(), hot["acq_date"].max().date()
             with date_box:
                 if dmin < dmax:
-                    d0, d1 = st.slider("Date range", dmin, dmax, (dmin, dmax),
-                                       format="YYYY-MM-DD", label_visibility="collapsed")
+                    d0, d1 = st.slider(
+                        "Date range",
+                        dmin,
+                        dmax,
+                        (dmin, dmax),
+                        format="YYYY-MM-DD",
+                        label_visibility="collapsed",
+                    )
                 else:
                     d0, d1 = dmin, dmax
             sub = hot[(hot["acq_date"] >= pd.Timestamp(d0)) & (hot["acq_date"] <= pd.Timestamp(d1))]
             if aoi_poly is not None:
                 sub = apply_aoi(sub, aoi_poly)
             if sub.empty:
-                st.warning("No hotspots in this area and period." if aoi_poly is not None
-                           else "No hotspots in this date range.")
+                st.warning(
+                    "No hotspots in this area and period." if aoi_poly is not None else "No hotspots in this date range."
+                )
                 sub = None
 
 aoi_area = polygon_area_km2(aoi_poly) if aoi_poly is not None else None
 if aoi_poly is not None:
     minx, miny, maxx, maxy = aoi_poly.bounds
-    sb.caption(f"About {aoi_area:,.0f} km², from {miny:.2f}° to {maxy:.2f}° N "
-               f"and {minx:.2f}° to {maxx:.2f}° E.")
+    sb.markdown(
+        f'<div class="aoi-box">AOI ~{aoi_area:,.0f} km²<br>'
+        f"{miny:.2f}° to {maxy:.2f}° N<br>{minx:.2f}° to {maxx:.2f}° E</div>",
+        unsafe_allow_html=True,
+    )
 
-# ---- Statistics -----------------------------------------------------------
+# Masthead with live orbital telemetry
+telemetry_html = ""
+if sub is not None:
+    sensors_present = [s for s in ("MODIS", "VIIRS") if s in set(sub["sensor"].astype(str))]
+    sensor_str = " + ".join(sensors_present) if sensors_present else "FIRMS"
+    scope_str = f"AOI {aoi_area:,.0f} km²" if aoi_poly is not None else "Whole region"
+    lat_c = float(sub["latitude"].mean())
+    lon_c = float(sub["longitude"].mean())
+    coord_str = f"{abs(lat_c):.1f}°{'N' if lat_c >= 0 else 'S'} {abs(lon_c):.1f}°{'E' if lon_c >= 0 else 'W'}"
+    telemetry_html = (
+        f'<div class="telemetry">'
+        f"<span>REGION <b>{escape(match_title)}</b></span>"
+        f"<span>CENTROID <b>{coord_str}</b></span>"
+        f"<span>SCOPE <b>{escape(scope_str)}</b></span>"
+        f"<span>RECORD <b>{escape(sensor_str)}</b></span>"
+        f"</div>"
+    )
+elif stems:
+    telemetry_html = (
+        f'<div class="telemetry">'
+        f"<span>COUNTRIES MAPPED <b>{len(regions)}</b></span>"
+        f"<span>ARCHIVES LOADED <b>{len(stems)}</b></span>"
+        f"</div>"
+    )
+
+st.markdown(
+    f'<div class="masthead">'
+    f"<div><h1>Fire Activity Explorer</h1>"
+    f'<p class="sub">Twenty-five years of satellite fire detections calibrated across MODIS and VIIRS, '
+    f"so any month, country, or custom polygon can be read against its historical baseline.</p></div>"
+    f"{telemetry_html}"
+    f"</div>",
+    unsafe_allow_html=True,
+)
+
+# Compute statistics for active selection
 status = None
+field_notes = []
 if sub is not None:
     lo, hi, tol = pd.Timestamp(d0), pd.Timestamp(d1), pd.Timedelta(days=3)
     first_y, last_y = int(sub["year"].min()), int(sub["year"].max())
@@ -1123,28 +1968,35 @@ if sub is not None:
     past_years = [y for y in years if y < ly]
     hist = (
         sub[(sub["month"] == lm) & (sub["year"] < ly) & (sub["acq_date"].dt.day <= last_day)]
-        .groupby("year")["weight"].sum().reindex(past_years, fill_value=0)
+        .groupby("year")["weight"]
+        .sum()
+        .reindex(past_years, fill_value=0)
     )
     if len(hist) > 0:
         status = status_for(current, hist)
 
-    modis_share = (annual_by_sensor["MODIS"] / annual_total) if "MODIS" in annual_by_sensor \
+    modis_share = (
+        (annual_by_sensor["MODIS"] / annual_total)
+        if "MODIS" in annual_by_sensor
         else pd.Series(0.0, index=annual_total.index)
+    )
     ytd = None
     past_full = [y for y in full_years if y < ly]
     if ly not in full_years and len(past_full) >= 4:
         upto = (sub["month"] < lm) | ((sub["month"] == lm) & (sub["acq_date"].dt.day <= last_day))
         ytd_by_year = sub[upto].groupby("year")["weight"].sum()
-        ytd = dict(year=ly, cur=float(ytd_by_year.get(ly, 0.0)),
-                   hist=ytd_by_year.reindex(past_full, fill_value=0.0),
-                   label=f"{calendar.month_abbr[lm]} {last_day}")
+        ytd = dict(
+            year=ly,
+            cur=float(ytd_by_year.get(ly, 0.0)),
+            hist=ytd_by_year.reindex(past_full, fill_value=0.0),
+            label=f"{calendar.month_abbr[lm]} {last_day}",
+        )
     verdicts = year_verdicts(annual_total, modis_share, pivot_cov, full_years, med_by_month, ytd)
     vmap = {v["year"]: v for v in verdicts}
     year_baseline = float(annual_total.loc[full_years].median()) if len(full_years) >= 4 else None
-
     region_text = match_title + (" (selected area)" if aoi_poly is not None else "")
+    field_notes = derive_field_notes(sub, med_by_month, info, verdicts, region_text)
 
-# ---- Overview and map -----------------------------------------------------
 draw_mode = bool(match) and aoi_mode == "Draw on map"
 aoi_key = hashlib.md5(aoi_poly.wkt.encode()).hexdigest()[:8] if aoi_poly is not None else "none"
 
@@ -1158,37 +2010,101 @@ HERO_LINES = {
 
 def render_map(msub, tag="all", height=640):
     m = base_map(style)
+
+    # Landing map: light up countries with loaded FIRMS archives
+    if match is None:
+        loaded_keys = [k for k in regions if has_data(k) and k in geoms_wkb and k not in ALIASES]
+        if loaded_keys:
+            feats = []
+            for k in loaded_keys:
+                g = shapely.from_wkb(geoms_wkb[k])
+                feats.append({
+                    "type": "Feature",
+                    "properties": {"region": k.title(), "key": k},
+                    "geometry": mapping(g),
+                })
+            folium.GeoJson(
+                {"type": "FeatureCollection", "features": feats},
+                style_function=lambda f: {
+                    "fillColor": "#f06428",
+                    "fillOpacity": 0.28,
+                    "color": "#f06428",
+                    "weight": 1.6,
+                },
+                highlight_function=lambda f: {
+                    "fillColor": "#f06428",
+                    "fillOpacity": 0.50,
+                    "color": "#f4f0e6",
+                    "weight": 2.2,
+                },
+                tooltip=folium.GeoJsonTooltip(fields=["region"], aliases=["Click to open"]),
+            ).add_to(m)
+
     if msub is not None:
         if layer == "Points":
-            n_all, n_shown = add_points(m, msub)
+            n_all, n_shown = add_points(m, msub, color_by="sensor")
             if n_shown < n_all:
-                st.caption(f"Showing {n_shown:,} of {n_all:,} detections, sampled evenly per sensor. "
-                           "Switch to Density grid to see the full counts.")
+                st.caption(
+                    f"Showing {n_shown:,} of {n_all:,} detections, sampled evenly per sensor. "
+                    "Switch to Density grid to see full counts."
+                )
+        elif layer == "Day vs night (solar)":
+            n_all, n_shown = add_points(m, msub, color_by="solar")
+            if n_all == 0:
+                st.info("This archive does not contain acquisition timestamps (`acq_time`) for day/night splitting.")
+            elif n_shown < n_all:
+                st.caption(
+                    f"Showing {n_shown:,} of {n_all:,} timestamped detections split by local solar clock."
+                )
         elif layer == "Density grid":
             cell, maxc = add_density(m, msub)
-            st.caption(f"Grid cell about {cell:g}° (~{int(cell * 111)} km). "
-                       f"Densest cell: {maxc:,} VIIRS-equivalent detections.")
+            st.caption(
+                f"Grid cell about {cell:g}° (~{int(cell * 111)} km). "
+                f"Densest cell: {maxc:,} VIIRS-equivalent detections."
+            )
         else:
             if len(full_years) >= 8:
                 recent, base = full_years[-5:], full_years[:-5]
                 cell, lim = add_change(m, sub, recent, base)
                 st.caption(
                     f"Mean annual detections per cell, {recent[0]}–{recent[-1]} compared with "
-                    f"{base[0]}–{base[-1]}. Orange means more fire than the baseline, purple means less "
-                    f"(strongest change about {lim:,.1f} per year per cell). This layer ignores the "
-                    "year and month filters."
+                    f"{base[0]}–{base[-1]}. Orange means more fire than baseline, purple means less "
+                    f"(strongest change about {lim:,.1f} per year per cell). Ignores map year/month filters."
                 )
             else:
                 st.info("The change layer needs at least eight complete years in the selected range.")
+
+    # Country boundary hairline for geographic framing
+    if match and aoi_poly is None and match in geoms_wkb:
+        country_geom = shapely.from_wkb(geoms_wkb[match])
+        folium.GeoJson(
+            mapping(country_geom),
+            style_function=lambda f: {
+                "color": "#cbc5b9",
+                "weight": 1.2,
+                "opacity": 0.42,
+                "fillOpacity": 0.0,
+            },
+        ).add_to(m)
+
     if aoi_poly is not None:
         folium.GeoJson(
             mapping(aoi_poly),
-            style_function=lambda f: {"color": AOI_COLOR, "weight": 2, "dashArray": "6 4",
-                                      "fillColor": AOI_COLOR, "fillOpacity": 0.04},
+            style_function=lambda f: {
+                "color": AOI_COLOR,
+                "weight": 2,
+                "dashArray": "6 4",
+                "fillColor": AOI_COLOR,
+                "fillOpacity": 0.05,
+            },
         ).add_to(m)
+
     if draw_mode and data_ready:
-        Draw(export=False, draw_options={"polyline": False, "marker": False, "circlemarker": False},
-             edit_options={"edit": False}).add_to(m)
+        Draw(
+            export=False,
+            draw_options={"polyline": False, "marker": False, "circlemarker": False},
+            edit_options={"edit": False},
+        ).add_to(m)
 
     if aoi_poly is not None:
         minx, miny, maxx, maxy = aoi_poly.bounds
@@ -1197,11 +2113,32 @@ def render_map(msub, tag="all", height=640):
         m.fit_bounds([[bbox[0], bbox[2]], [bbox[1], bbox[3]]])
     m.get_root().html.add_child(folium.Element(ATTRIBUTION_FIX))
 
+    ret_objs = []
+    if draw_mode and data_ready:
+        ret_objs = ["all_drawings"]
+    elif match is None:
+        ret_objs = ["last_clicked"]
+
     result = st_folium(
-        m, height=height, use_container_width=True,
-        returned_objects=["all_drawings"] if (draw_mode and data_ready) else [],
+        m,
+        height=height,
+        use_container_width=True,
+        returned_objects=ret_objs,
         key=f"map-{match}-{layer}-{style}-{aoi_key}-{tag}",
     )
+
+    if match is None and result and result.get("last_clicked"):
+        clk = (round(result["last_clicked"]["lat"], 4), round(result["last_clicked"]["lng"], 4))
+        if clk != st.session_state.get("_land_click"):
+            st.session_state["_land_click"] = clk
+            pt = Point(clk[1], clk[0])
+            candidates = [k for k in regions if has_data(k) and k in geoms_wkb and k not in ALIASES]
+            candidates += [k for k in geoms_wkb if k not in candidates and k not in ALIASES]
+            for k in candidates:
+                if shapely.from_wkb(geoms_wkb[k]).contains(pt):
+                    st.session_state["region_pick"] = k
+                    st.rerun()
+
     if draw_mode and data_ready and result and result.get("all_drawings"):
         poly = drawing_to_polygon(result["all_drawings"][-1])
         if poly is not None:
@@ -1211,48 +2148,91 @@ def render_map(msub, tag="all", height=640):
                 st.rerun()
 
 
+def render_field_notes(notes):
+    if not notes:
+        return
+    cards = []
+    for n in notes:
+        cards.append(
+            f'<div class="fnote {n["key"]}">'
+            f'<div class="fnote-tag">{escape(n["tag"])}</div>'
+            f'<div class="fnote-head">{escape(n["head"])}</div>'
+            f'<div class="fnote-body">{escape(n["body"])}</div>'
+            f"</div>"
+        )
+    st.markdown(f'<div class="notes-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
 def render_overview():
-    st.markdown('<div class="ribbon-title" style="margin-top:.2rem">Every year at a glance</div>',
-                unsafe_allow_html=True)
-    render_stripes(verdicts)
-    st.caption("One stripe per year. Orange means more fire than the usual year, purple means less, "
-               "and grey-green is about usual. Hover over a stripe for the verdict.")
+    render_stripes(verdicts, title="Every year at a glance")
+    st.caption(
+        "One stripe per year. Orange marks heavier fire years than usual, purple marks quieter years, "
+        "and dark grey-green sits near the median. Hover any stripe for its verdict."
+    )
+
+    # Field notes derived from the live region/AOI data
+    render_field_notes(field_notes)
+
     left, right = st.columns([4, 8], gap="large")
 
     with left:
-        st.caption(f"Showing {region_text}.")
+        st.markdown(
+            f'<div class="region-head">'
+            f'<span class="title">{escape(region_text)}</span>'
+            f'<span class="span">{d0:%Y}–{d1:%Y}</span>'
+            f"</div>",
+            unsafe_allow_html=True,
+        )
         if status is not None:
             if status["median"] > 0:
                 ratio_txt = f"{current / status['median']:.1f}× the median ({fmt(status['median'])})"
             else:
                 ratio_txt = "where the median year had none"
+            badge = LEVEL_LABELS.get(status["level"], "Status")
             st.markdown(
-                f'<div class="hero {status["level"]}">'
-                f'<div class="hero-line">{HERO_LINES[status["level"]]}</div>'
-                f'<div class="hero-sub">{calendar.month_name[lm]} 1–{last_day}, {ly}: {fmt(current)} detections, '
-                f'{ratio_txt} for the same days across the {len(hist)} earlier years. '
-                f'It ranks {ordinal(status["rank"])} highest of {status["n"]}.</div></div>',
+                f'<div class="verdict {status["level"]}">'
+                f'<div class="verdict-meta">{escape(badge)} · Rank {status["rank"]} of {status["n"]}</div>'
+                f'<div class="verdict-head">{HERO_LINES[status["level"]]}</div>'
+                f'<div class="verdict-body">{calendar.month_name[lm]} 1–{last_day}, {ly}: {fmt(current)} detections, '
+                f"{ratio_txt} for the same days across the {len(hist)} earlier years.</div></div>",
                 unsafe_allow_html=True,
             )
 
         a, b = st.columns(2)
-        a.metric("Hotspots detected", fmt(len(sub)),
-                 help="Individual detections kept after the quality filters and the MODIS/VIIRS splice.")
-        b.metric("Harmonized total", fmt(sub["weight"].sum()),
-                 help="VIIRS-equivalent detections: per-satellite normalized, MODIS scaled.")
+        a.metric(
+            "Hotspots detected",
+            fmt(len(sub)),
+            help="Individual detections kept after quality filters and the MODIS/VIIRS splice.",
+        )
+        b.metric(
+            "Harmonized total",
+            fmt(sub["weight"].sum()),
+            help="VIIRS-equivalent detections: per-satellite normalized, MODIS scaled.",
+        )
         c, d = st.columns(2)
-        c.metric("Peak month", calendar.month_name[int(med_by_month.idxmax())] if med_by_month.notna().any() else "n/a",
-                 help="Calendar month with the highest median across complete months.")
+        c.metric(
+            "Peak month",
+            calendar.month_name[int(med_by_month.idxmax())] if med_by_month.notna().any() else "n/a",
+            help="Calendar month with the highest median across complete months.",
+        )
         label = f"{calendar.month_abbr[lm]} {ly}, days 1–{last_day}"
         if status is not None:
-            d.metric(label, fmt(current), delta=f"{current - status['median']:+,.0f} vs median",
-                     delta_color="inverse", help=f"Median of the same days in earlier years: {fmt(status['median'])}.")
+            d.metric(
+                label,
+                fmt(current),
+                delta=f"{current - status['median']:+,.0f} vs median",
+                delta_color="inverse",
+                help=f"Median of the same days in earlier years: {fmt(status['median'])}.",
+            )
         else:
             d.metric(label, fmt(current))
         e, g = st.columns(2)
         if trend_h is not None:
-            e.metric("Annual trend", f"{trend_h[0]:+.1f}% / yr",
-                     help=f"Theil-Sen slope over {len(full_years)} complete years, relative to the median year.")
+            e.metric(
+                "Annual trend",
+                f"{trend_h[0]:+.1f}% / yr",
+                help=f"Theil-Sen slope over {len(full_years)} complete years, relative to the median year.",
+            )
         else:
             e.metric("Annual trend", "n/a", help="Needs at least five complete years in the selected range.")
         g.metric("Latest data", f"{dmax:%d %b %Y}")
@@ -1263,18 +2243,18 @@ def render_overview():
             for mo in range(1, 13):
                 v = med_by_month.get(mo, np.nan)
                 frac = 0.0 if pd.isna(v) else float(v) / top
-                ring = "box-shadow: inset 0 0 0 2px #a8c08a;" if mo == lm else ""
-                ink = "#171c1b" if frac > 0.6 else "#e8e6df"
+                ring = "box-shadow: inset 0 0 0 2px #8fb369;" if mo == lm else ""
+                ink = "#0c0d0b" if frac > 0.56 else "#f4f0e6"
                 tip = f"{calendar.month_name[mo]}: median {fmt(0 if pd.isna(v) else v)} detections"
                 cells.append(
-                    f'<div class="ribbon-cell" title="{tip}" style="background: rgba(239,108,51,{0.07 + 0.88 * frac:.2f});'
+                    f'<div class="ribbon-cell" title="{tip}" style="background: rgba(240,100,40,{0.08 + 0.88 * frac:.2f});'
                     f' color: {ink}; {ring}">{calendar.month_abbr[mo]}</div>'
                 )
             st.markdown(
                 '<div class="ribbon-title">When this area usually burns</div>'
                 f'<div class="ribbon">{"".join(cells)}</div>'
                 '<p class="note" style="margin-top:.4rem">Median detections per calendar month across complete '
-                "years. The outlined month is the latest one in your data.</p>",
+                "years. The outlined cell marks the latest month in the archive.</p>",
                 unsafe_allow_html=True,
             )
 
@@ -1288,18 +2268,43 @@ def render_overview():
 
     with right:
         years_all = sorted(int(y) for y in sub["year"].unique())
-        st.caption("Pick a year, or a few months, to see only that window on the map. "
-                   "The figures on the left always cover the whole period.")
+        m_ctrl1, m_ctrl2 = st.columns([3, 1], gap="small")
+        m_ctrl1.caption(
+            "Filter the map by year or months. Summary figures on the left always cover the full period."
+        )
+        peak_3 = (
+            sorted(int(m) for m in med_by_month.dropna().nlargest(3).index)
+            if med_by_month.notna().any() and med_by_month.max() > 0
+            else list(range(1, 13))
+        )
+        if m_ctrl2.button("Peak season", key=f"peak_btn_{match}_{aoi_key}", help="Isolate the 3 busiest calendar months on the map"):
+            st.session_state["map_months"] = peak_3
+            st.rerun()
+
         year_pick = st.select_slider(
-            "Year on the map", options=["All years"] + years_all, value="All years",
-            key=f"map_year_{match}_{years_all[0]}_{years_all[-1]}_{aoi_key}")
+            "Year on the map",
+            options=["All years"] + years_all,
+            value="All years",
+            key=f"map_year_{match}_{years_all[0]}_{years_all[-1]}_{aoi_key}",
+        )
         month_opts = list(range(1, 13))
         if hasattr(st, "pills"):
-            month_pick = st.pills("Months on the map", month_opts, selection_mode="multi", default=month_opts,
-                                  format_func=lambda mo: calendar.month_abbr[mo], key="map_months")
+            month_pick = st.pills(
+                "Months on the map",
+                month_opts,
+                selection_mode="multi",
+                default=month_opts,
+                format_func=lambda mo: calendar.month_abbr[mo],
+                key="map_months",
+            )
         else:
-            month_pick = st.multiselect("Months on the map", month_opts, default=month_opts,
-                                        format_func=lambda mo: calendar.month_abbr[mo], key="map_months")
+            month_pick = st.multiselect(
+                "Months on the map",
+                month_opts,
+                default=month_opts,
+                format_func=lambda mo: calendar.month_abbr[mo],
+                key="map_months",
+            )
         month_pick = list(month_pick or month_opts)
 
         msub = sub
@@ -1313,68 +2318,129 @@ def render_overview():
             render_map(None, tag)
         else:
             if len(msub) < len(sub):
-                st.caption(f"{fmt(len(msub))} detections in this window.")
+                st.caption(f"{fmt(len(msub))} detections in this map window.")
             render_map(msub, tag)
 
-# ---- Tabs -----------------------------------------------------------------
+
+# Main workspace
 if sub is not None:
     t_over, t_year, t_cal, t_trend, t_time, t_harm, t_data = st.tabs(
-        ["Overview", "Year by year", "Calendar", "Trends", "Timelapse", "Harmonization", "Data"])
+        ["Overview", "Year by year", "Calendar & clock", "Trends & pacing", "Timelapse", "Harmonization", "Data"]
+    )
 
     with t_over:
         render_overview()
 
     with t_year:
-        st.markdown(f'<p class="lede">{escape(years_summary(verdicts, region_text, year_baseline))}</p>',
-                    unsafe_allow_html=True)
-        render_stripes(verdicts)
-        opts = [v["year"] for v in verdicts]
-        pick = st.select_slider("Year in focus", options=opts, value=opts[-1],
-                                key=f"year_pick_{match}_{aoi_key}_{opts[0]}_{opts[-1]}")
-        vy = vmap[pick]
         st.markdown(
-            f'<div class="hero {vy["level"]}"><div class="hero-line">{pick}: {escape(vy["headline"])}</div>'
-            f'<div class="hero-sub">{escape(vy["detail"])}</div></div>',
+            f'<p class="lede">{escape(years_summary(verdicts, region_text, year_baseline))}</p>',
             unsafe_allow_html=True,
         )
+        opts = [v["year"] for v in verdicts]
+        yc1, yc2 = st.columns([3, 1], gap="medium")
+        pick = yc1.select_slider(
+            "Year in focus",
+            options=opts,
+            value=opts[-1],
+            key=f"year_pick_{match}_{aoi_key}_{opts[0]}_{opts[-1]}",
+        )
+        comp_opts = ["None"] + [str(y) for y in reversed(opts) if y != pick]
+        comp_pick = yc2.selectbox("Compare with year", comp_opts, index=0, key=f"year_comp_{match}_{aoi_key}")
+
+        render_stripes(verdicts, title="Annual anomaly strip (selected year outlined)", active_year=pick)
+        vy = vmap[pick]
+        y_badge = LEVEL_LABELS.get(vy["level"], "Year verdict")
+        rank_suffix = f" · Rank {vy['rank']} of {vy['n']}" if vy.get("rank") else ""
+        st.markdown(
+            f'<div class="verdict {vy["level"]}">'
+            f'<div class="verdict-meta">{escape(y_badge)}{escape(rank_suffix)}</div>'
+            f'<div class="verdict-head">{pick}: {escape(vy["headline"])}</div>'
+            f'<div class="verdict-body">{escape(vy["detail"])}</div></div>',
+            unsafe_allow_html=True,
+        )
+
         mn = [calendar.month_abbr[c] for c in range(1, 13)]
         row = pivot_cov.loc[pick].astype(float)
         qs = pivot_full.quantile([0.25, 0.5, 0.75])
         mfig = go.Figure()
         if qs.notna().any().any():
-            mfig.add_trace(go.Scatter(x=mn, y=qs.loc[0.75].to_numpy(), mode="lines", line=dict(width=0),
-                                      showlegend=False, hoverinfo="skip"))
-            mfig.add_trace(go.Scatter(x=mn, y=qs.loc[0.25].to_numpy(), mode="lines", line=dict(width=0),
-                                      fill="tonexty", fillcolor="rgba(138,143,152,.25)",
-                                      name="Middle 50% of years", hoverinfo="skip"))
-            mfig.add_trace(go.Scatter(x=mn, y=qs.loc[0.5].to_numpy(), mode="lines",
-                                      line=dict(color=OTHER_COLOR, width=2, dash="dash"), name="Usual month"))
+            mfig.add_trace(
+                go.Scatter(x=mn, y=qs.loc[0.75].to_numpy(), mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip")
+            )
+            mfig.add_trace(
+                go.Scatter(
+                    x=mn,
+                    y=qs.loc[0.25].to_numpy(),
+                    mode="lines",
+                    line=dict(width=0),
+                    fill="tonexty",
+                    fillcolor="rgba(146,141,130,.18)",
+                    name="Middle 50% of years",
+                    hoverinfo="skip",
+                )
+            )
+            mfig.add_trace(
+                go.Scatter(
+                    x=mn,
+                    y=qs.loc[0.5].to_numpy(),
+                    mode="lines",
+                    line=dict(color=OTHER_COLOR, width=2, dash="dash"),
+                    name="Usual month",
+                )
+            )
         mfig.add_bar(x=mn, y=row.to_numpy(), name=str(pick), marker_color=LEVEL_COLORS[vy["level"]])
-        show(tidy(mfig, f"{pick} month by month against the usual year", 340), "yearchart")
+        if comp_pick != "None":
+            cy = int(comp_pick)
+            crow = pivot_cov.loc[cy].astype(float)
+            mfig.add_bar(
+                x=mn,
+                y=crow.to_numpy(),
+                name=str(cy),
+                marker_color="rgba(244,240,230,0.34)",
+            )
+            mfig.update_layout(barmode="group")
+
+        chart_title = (
+            f"{pick} vs {comp_pick} month by month"
+            if comp_pick != "None"
+            else f"{pick} month by month against the usual year"
+        )
+        show(tidy(mfig, chart_title, 340), "yearchart")
 
         cards = []
         for v in verdicts:
+            active_cls = " active" if v["year"] == pick else ""
             cards.append(
-                f'<div class="yearcard {v["level"]}" title="{escape(v["detail"], quote=True)}">'
-                f'<div class="y">{v["year"]}</div><div class="h">{escape(v["headline"])}</div>'
+                f'<div class="yearcard {v["level"]}{active_cls}" title="{escape(v["detail"], quote=True)}">'
+                f'<div><div class="y">{v["year"]}</div><div class="h">{escape(v["headline"])}</div></div>'
                 f'<div class="s">{escape(v["short"])}</div></div>'
             )
         st.markdown(f'<div class="yeargrid">{"".join(cards)}</div>', unsafe_allow_html=True)
-        st.caption("Each year is rated against the usual (median) complete year in the selected area and period. "
-                   "Hover over a card for the full sentence.")
+        st.caption(
+            "Each year is rated against the usual (median) complete year in the selected area and period. "
+            "Hover any card for the full breakdown."
+        )
 
     with t_cal:
         ca, cb = st.columns([2, 1])
         mode_c = ca.radio("Show", ["Detections", "Anomaly vs median"], horizontal=True, key="calmode")
-        ramp = cb.selectbox("Colour ramp", ["Inferno", "Viridis", "Cividis"], key="ramp",
-                            help="All three are perceptually uniform and readable with colour-vision deficiency.",
-                            disabled=mode_c != "Detections")
+        ramp = cb.selectbox(
+            "Colour ramp",
+            ["Inferno", "Viridis", "Cividis"],
+            key="ramp",
+            help="Perceptually uniform ramps readable with colour-vision deficiency.",
+            disabled=mode_c != "Detections",
+        )
         mnames = [calendar.month_abbr[c] for c in range(1, 13)]
         if mode_c == "Detections":
             heat_df = pivot_cov.copy()
             heat_df.columns = mnames
-            heat = px.imshow(heat_df, color_continuous_scale=ramp, aspect="auto",
-                             labels=dict(x="Month", y="Year", color="Detections"))
+            heat = px.imshow(
+                heat_df,
+                color_continuous_scale=ramp,
+                aspect="auto",
+                labels=dict(x="Month", y="Year", color="Detections"),
+            )
             heat.update_traces(texttemplate="%{z:.2~s}", textfont_size=9)
             heat_title = f"Monthly detections, {region_text}"
         else:
@@ -1383,26 +2449,82 @@ if sub is not None:
             vals = np.abs(anom.to_numpy(float))
             lim = float(np.nanpercentile(vals, 95)) if np.isfinite(vals).any() else 100.0
             lim = min(max(lim, 50.0), 300.0)
-            heat = px.imshow(anom, color_continuous_scale="PuOr_r", zmin=-lim, zmax=lim, aspect="auto",
-                             labels=dict(x="Month", y="Year", color="% vs median"))
+            heat = px.imshow(
+                anom,
+                color_continuous_scale="PuOr_r",
+                zmin=-lim,
+                zmax=lim,
+                aspect="auto",
+                labels=dict(x="Month", y="Year", color="% vs median"),
+            )
             heat.update_traces(texttemplate="%{z:+.0f}%", textfont_size=9)
             heat_title = f"Deviation from each calendar month's median, {region_text}"
-        heat.update_yaxes(type="category", automargin=True)
-        heat.update_xaxes(automargin=True)
+        heat.update_yaxes(type="category", automargin=True, tickfont=dict(color="#928d82"))
+        heat.update_xaxes(automargin=True, tickfont=dict(color="#928d82"))
         heat.update_layout(
             height=max(300, 30 * len(pivot_cov) + 140),
-            margin=dict(l=10, r=10, t=56, b=10),
-            title=dict(text=heat_title, x=0, xanchor="left", y=0.98, yanchor="top",
-                       yref="container", font=dict(size=14)),
-            coloraxis_colorbar=dict(title=None, thickness=12, len=0.9),
-            font=dict(family=FONT_PLOT, size=12),
+            margin=dict(l=6, r=6, t=56, b=8),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            title=dict(
+                text=heat_title,
+                x=0,
+                xanchor="left",
+                y=0.98,
+                yanchor="top",
+                yref="container",
+                font=dict(size=14, color="#f4f0e6"),
+            ),
+            coloraxis_colorbar=dict(title=None, thickness=12, len=0.9, tickfont=dict(color="#928d82")),
+            hoverlabel=dict(
+                bgcolor="#171916",
+                bordercolor="rgba(244,240,230,0.28)",
+                font=dict(size=12, family=FONT_PLOT, color="#f4f0e6"),
+            ),
+            font=dict(family=FONT_PLOT, size=12, color="#cbc5b9"),
         )
         show(heat, "calendar")
-        st.caption("Partial months at the edges of the range appear in the detections view and are "
-                   "left blank in the anomaly view. Anomaly colours: orange above the median, purple below.")
+        st.caption(
+            "Partial months at the edges of the range appear in the detections view and are "
+            "left blank in the anomaly view. Anomaly colours: orange above the median, purple below."
+        )
 
-        flat = (pivot_full.rename_axis("year").reset_index()
-                .melt(id_vars="year", var_name="month", value_name="n").dropna())
+        # Diurnal solar clock chart if acq_time was present
+        valid_lh = sub["local_hour"].to_numpy() >= 0
+        if valid_lh.any():
+            hr_df = pd.DataFrame({
+                "hour": sub["local_hour"].to_numpy()[valid_lh],
+                "sensor": sub["sensor"].astype(str).to_numpy()[valid_lh],
+                "w": sub["weight"].to_numpy()[valid_lh],
+            })
+            hr_piv = (
+                hr_df.groupby(["hour", "sensor"])["w"]
+                .sum()
+                .unstack(fill_value=0.0)
+                .reindex(index=range(24), fill_value=0.0)
+            )
+            hfig = go.Figure()
+            for s, nm in (("MODIS", "MODIS"), ("VIIRS", "VIIRS"), ("UNKNOWN", "Other")):
+                if s in hr_piv.columns and hr_piv[s].sum() > 0:
+                    hfig.add_bar(
+                        x=[f"{h:02d}:00" for h in range(24)],
+                        y=hr_piv[s].to_numpy(),
+                        name=nm,
+                        marker_color=SENSOR_COLORS[s],
+                    )
+            hfig.update_layout(barmode="stack")
+            show(tidy(hfig, "24-hour local solar burn clock (sun-synchronous overpass timing)", 300), "diurnal")
+            st.caption(
+                "Approximate local solar hour derived from UTC acquisition time and longitude. "
+                "Peaks reflect when fires are active during Terra (~10:30/22:30) and Aqua/VIIRS (~13:30/01:30) passes."
+            )
+
+        flat = (
+            pivot_full.rename_axis("year")
+            .reset_index()
+            .melt(id_vars="year", var_name="month", value_name="n")
+            .dropna()
+        )
         tl, tr_ = st.columns(2)
         if not flat.empty:
             top_m = flat.nlargest(8, "n").copy()
@@ -1410,28 +2532,49 @@ if sub is not None:
             top_m["Detections"] = top_m["n"].round(0).astype(int)
             top_m["Times the median"] = [
                 f"{n / med_by_month[int(mo)]:.1f}×" if med_by_month[int(mo)] > 0 else "n/a"
-                for n, mo in zip(top_m["n"], top_m["month"])]
+                for n, mo in zip(top_m["n"], top_m["month"])
+            ]
             tl.markdown("**Most active months**")
             tl.dataframe(top_m[["Month", "Detections", "Times the median"]], hide_index=True)
         if len(full_years) >= 1:
             top_y = annual_total.loc[full_years].nlargest(8)
             tr_.markdown("**Most active complete years**")
-            tr_.dataframe(pd.DataFrame({"Year": top_y.index.astype(int), "Detections": top_y.round(0).astype(int).to_numpy()}),
-                          hide_index=True)
+            tr_.dataframe(
+                pd.DataFrame({"Year": top_y.index.astype(int), "Detections": top_y.round(0).astype(int).to_numpy()}),
+                hide_index=True,
+            )
 
         q = pivot_full.quantile([0.25, 0.5, 0.75])
         if q.notna().any().any():
             sc = go.Figure()
-            sc.add_trace(go.Scatter(x=mnames, y=q.loc[0.75].to_numpy(), mode="lines",
-                                    line=dict(width=0), showlegend=False, hoverinfo="skip"))
-            sc.add_trace(go.Scatter(x=mnames, y=q.loc[0.25].to_numpy(), mode="lines", line=dict(width=0),
-                                    fill="tonexty", fillcolor="rgba(138,143,152,.25)",
-                                    name="Middle 50% of years", hoverinfo="skip"))
-            sc.add_trace(go.Scatter(x=mnames, y=q.loc[0.5].to_numpy(), mode="lines",
-                                    line=dict(color=OTHER_COLOR, width=2), name="Median"))
-            sc.add_trace(go.Scatter(x=mnames, y=pivot_cov.loc[last_y].to_numpy(), mode="lines+markers",
-                                    line=dict(color=VIIRS_COLOR, width=2.5), marker=dict(size=6),
-                                    name=str(last_y)))
+            sc.add_trace(
+                go.Scatter(x=mnames, y=q.loc[0.75].to_numpy(), mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip")
+            )
+            sc.add_trace(
+                go.Scatter(
+                    x=mnames,
+                    y=q.loc[0.25].to_numpy(),
+                    mode="lines",
+                    line=dict(width=0),
+                    fill="tonexty",
+                    fillcolor="rgba(146,141,130,.18)",
+                    name="Middle 50% of years",
+                    hoverinfo="skip",
+                )
+            )
+            sc.add_trace(
+                go.Scatter(x=mnames, y=q.loc[0.5].to_numpy(), mode="lines", line=dict(color=OTHER_COLOR, width=2), name="Median")
+            )
+            sc.add_trace(
+                go.Scatter(
+                    x=mnames,
+                    y=pivot_cov.loc[last_y].to_numpy(),
+                    mode="lines+markers",
+                    line=dict(color=VIIRS_COLOR, width=2.5),
+                    marker=dict(size=6),
+                    name=str(last_y),
+                )
+            )
             show(tidy(sc, "Seasonal cycle against the latest year", 340), "season")
 
     with t_trend:
@@ -1442,29 +2585,133 @@ if sub is not None:
                 kw = {}
                 if s == "MODIS" and ci and not scaling.startswith("By") and info["factor"] > 0:
                     v = annual_by_sensor[s]
-                    kw["error_y"] = dict(type="data", symmetric=False, thickness=1, width=2,
-                                         array=(v * (ci[1] / info["factor"] - 1)).to_numpy(),
-                                         arrayminus=(v * (1 - ci[0] / info["factor"])).to_numpy())
-                ann.add_bar(x=annual_by_sensor.index, y=annual_by_sensor[s], name=nm,
-                            marker_color=SENSOR_COLORS[s], **kw)
+                    kw["error_y"] = dict(
+                        type="data",
+                        symmetric=False,
+                        thickness=1,
+                        width=2,
+                        array=(v * (ci[1] / info["factor"] - 1)).to_numpy(),
+                        arrayminus=(v * (1 - ci[0] / info["factor"])).to_numpy(),
+                    )
+                ann.add_bar(
+                    x=annual_by_sensor.index,
+                    y=annual_by_sensor[s],
+                    name=nm,
+                    marker_color=SENSOR_COLORS[s],
+                    **kw,
+                )
         ann.update_layout(barmode="stack")
         if trend_h is not None:
             xs = np.array([min(full_years), max(full_years)])
-            ann.add_scatter(x=xs, y=trend_h[1] * xs + trend_h[2], mode="lines", name="Trend (Theil-Sen)",
-                            line=dict(color=OTHER_COLOR, dash="dash", width=2))
+            ann.add_scatter(
+                x=xs,
+                y=trend_h[1] * xs + trend_h[2],
+                mode="lines",
+                name="Trend (Theil-Sen)",
+                line=dict(color=SAGE_COLOR, dash="dash", width=2),
+            )
         ann.update_xaxes(dtick=2)
         show(tidy(ann, "Annual detections, VIIRS-equivalent (partial years included)"), "annual")
         if ci and not scaling.startswith("By"):
             st.caption("Whiskers on the MODIS-derived bars show the bootstrap range of the scaling factor.")
 
+        # Cumulative year-over-year burn pacing
+        if len(full_years) >= 3:
+            doy_df = sub.assign(doy=sub["acq_date"].dt.dayofyear.clip(upper=365))
+            daily = (
+                doy_df.groupby(["year", "doy"])["weight"]
+                .sum()
+                .unstack("doy")
+                .reindex(columns=range(1, 366), fill_value=0.0)
+                .cumsum(axis=1)
+            )
+            month_starts = [pd.Timestamp(2021, m, 1).dayofyear for m in range(1, 13)]
+            month_labels = [calendar.month_abbr[m] for m in range(1, 13)]
+
+            spot_opts = sorted([int(y) for y in daily.index], reverse=True)
+            spot_year = st.selectbox(
+                "Spotlight year on cumulative curve",
+                spot_opts,
+                index=0,
+                key=f"cum_spot_{match}_{aoi_key}",
+            )
+
+            cfig = go.Figure()
+            for y in full_years:
+                if y == spot_year:
+                    continue
+                cfig.add_trace(
+                    go.Scatter(
+                        x=list(range(1, 366)),
+                        y=daily.loc[y].to_numpy(),
+                        mode="lines",
+                        line=dict(color="rgba(203,197,185,0.16)", width=1),
+                        name=str(y),
+                        showlegend=False,
+                        hovertemplate=f"{y} · Day %{{x}}: %{{y:,.0f}}<extra></extra>",
+                    )
+                )
+
+            med_cum = daily.loc[full_years].median()
+            cfig.add_trace(
+                go.Scatter(
+                    x=list(range(1, 366)),
+                    y=med_cum.to_numpy(),
+                    mode="lines",
+                    line=dict(color=SAGE_COLOR, width=2, dash="dash"),
+                    name="Median year",
+                )
+            )
+
+            spot_vals = daily.loc[spot_year].to_numpy()
+            if spot_year == ly and ly not in full_years:
+                cutoff = min(int(latest.dayofyear), 365)
+                xs_spot = list(range(1, cutoff + 1))
+                ys_spot = spot_vals[:cutoff]
+            else:
+                xs_spot = list(range(1, 366))
+                ys_spot = spot_vals
+
+            cfig.add_trace(
+                go.Scatter(
+                    x=xs_spot,
+                    y=ys_spot,
+                    mode="lines",
+                    line=dict(color=VIIRS_COLOR, width=3),
+                    name=str(spot_year),
+                )
+            )
+            if len(xs_spot):
+                cfig.add_trace(
+                    go.Scatter(
+                        x=[xs_spot[-1]],
+                        y=[ys_spot[-1]],
+                        mode="markers",
+                        marker=dict(color=VIIRS_COLOR, size=8, line=dict(color="#0c0d0b", width=1.5)),
+                        showlegend=False,
+                        hoverinfo="skip",
+                    )
+                )
+            cfig.update_xaxes(tickmode="array", tickvals=month_starts, ticktext=month_labels)
+            show(tidy(cfig, f"Cumulative burn pacing: {spot_year} against all complete years", 360), "cumpace")
+
         if status is not None:
             vals = pd.concat([hist, pd.Series({ly: current})])
-            bar = go.Figure(go.Bar(
-                x=vals.index, y=vals.to_numpy(),
-                marker_color=[OTHER_COLOR] * len(hist) + [VIIRS_COLOR], showlegend=False))
-            bar.add_scatter(x=[vals.index.min(), vals.index.max()], y=[status["median"]] * 2,
-                            mode="lines", name="Median of past years",
-                            line=dict(color=OTHER_COLOR, dash="dash", width=2))
+            bar = go.Figure(
+                go.Bar(
+                    x=vals.index,
+                    y=vals.to_numpy(),
+                    marker_color=["rgba(146,141,130,0.48)"] * len(hist) + [VIIRS_COLOR],
+                    showlegend=False,
+                )
+            )
+            bar.add_scatter(
+                x=[vals.index.min(), vals.index.max()],
+                y=[status["median"]] * 2,
+                mode="lines",
+                name="Median of past years",
+                line=dict(color=SAGE_COLOR, dash="dash", width=2),
+            )
             bar.update_xaxes(dtick=2)
             show(tidy(bar, f"{calendar.month_name[lm]}, days 1–{last_day}, every year"), "monthcmp")
 
@@ -1499,85 +2746,135 @@ if sub is not None:
             cap = max(float(tl["w"].quantile(0.99)), 1.0)
 
             tile_style = style if style in ("Dark", "Light", "Satellite") else "Dark"
-            layer_def = dict(below="traces", sourcetype="raster", source=[TILES[tile_style]["tiles"]],
-                             sourceattribution="Tiles © Esri")
-            args = dict(lat="lat", lon="lon", z="w", radius=14, animation_frame="year",
-                        center=dict(lat=(lat_lo + lat_hi) / 2, lon=(lon_lo + lon_hi) / 2), zoom=zoom_t,
-                        color_continuous_scale="YlOrRd", range_color=(0, cap), opacity=0.85)
+            layer_def = dict(
+                below="traces",
+                sourcetype="raster",
+                source=[TILES[tile_style]["tiles"]],
+                sourceattribution="Tiles © Esri",
+            )
+            args = dict(
+                lat="lat",
+                lon="lon",
+                z="w",
+                radius=14,
+                animation_frame="year",
+                center=dict(lat=(lat_lo + lat_hi) / 2, lon=(lon_lo + lon_hi) / 2),
+                zoom=zoom_t,
+                color_continuous_scale="YlOrRd",
+                range_color=(0, cap),
+                opacity=0.85,
+            )
             if hasattr(px, "density_map"):
                 fig_t = px.density_map(tl, map_style="white-bg", **args)
                 fig_t.update_layout(map_layers=[layer_def])
             else:
                 fig_t = px.density_mapbox(tl, mapbox_style="white-bg", **args)
                 fig_t.update_layout(mapbox_layers=[layer_def])
-            fig_t.update_layout(height=640, margin=dict(l=0, r=0, t=0, b=0),
-                                coloraxis_colorbar=dict(title="Detections per cell", thickness=12))
-            st.caption("Press play to watch the burning season by season. Each frame is one year of "
-                       f"VIIRS-equivalent detections on a grid of about {cell_t:g}°. "
-                       "The colour scale is the same in every frame, so years can be compared.")
+            fig_t.update_layout(
+                height=640,
+                margin=dict(l=0, r=0, t=0, b=0),
+                paper_bgcolor="rgba(0,0,0,0)",
+                font=dict(family=FONT_PLOT, color="#cbc5b9"),
+                coloraxis_colorbar=dict(title="Detections / cell", thickness=12, tickfont=dict(color="#928d82")),
+            )
+            st.caption(
+                "Press play to watch the burning season by season. Each frame is one year of "
+                f"VIIRS-equivalent detections on a grid of about {cell_t:g}°. "
+                "The colour scale is locked across every frame so years can be compared directly."
+            )
             show(fig_t, "timelapse")
         except Exception as exc:
             st.info(f"The timelapse could not be drawn here ({exc}). Update plotly to 5.24 or newer and try again.")
 
     with t_harm:
         if not info["has_both"]:
-            st.info("This file has one sensor only, so no MODIS/VIIRS harmonization is needed. "
-                    "Detections are still normalized per satellite.")
+            st.info(
+                "This file has one sensor only, so no MODIS/VIIRS harmonization is needed. "
+                "Detections are still normalized per satellite."
+            )
         else:
             split = info["split"]
             st.markdown(
-                f"""
-<p class="note">
-<b>1. Filter.</b> Low-confidence and non-vegetation detections are removed (see sidebar).<br>
-<b>2. Per-satellite normalization.</b> Each detection is divided by the number of satellites of its
-sensor already in orbit on that date, so Terra alone before Aqua, or SNPP alone before NOAA-20,
-is on the same footing as the full constellation.<br>
-<b>3. Scaling.</b> From {split:%B %Y} both sensors overlap. For every month with enough detections
-the VIIRS / MODIS ratio is computed, and its median is the factor ({info['factor']:.2f}).
-The factor is calibrated on the whole file, so it stays stable when you zoom to a small area.<br>
-<b>4. Splice.</b> Scaled MODIS is used before {split:%B %Y} and VIIRS after it, so no month is counted twice.
-</p>""",
+                f'<div class="method-list">'
+                f'<div class="method-item"><b>1. Filter</b>'
+                f"<p>Low-confidence and non-vegetation detections are removed per your sidebar settings.</p></div>"
+                f'<div class="method-item"><b>2. Per-satellite weight</b>'
+                f"<p>Each detection is divided by the active satellite count of its sensor on that date.</p></div>"
+                f'<div class="method-item"><b>3. Cross-calibration</b>'
+                f'<p>From {split:%B %Y}, overlapping months give a median VIIRS / MODIS ratio of ×{info["factor"]:.2f} across the full file.</p></div>'
+                f'<div class="method-item"><b>4. Splice</b>'
+                f"<p>Scaled MODIS covers the record before {split:%B %Y}; VIIRS covers {split:%B %Y} onward without double-counting.</p></div>"
+                f"</div>",
                 unsafe_allow_html=True,
             )
             ci = info["factor_ci"]
             h1, h2, h3, h4 = st.columns(4)
-            h1.metric("Scaling factor", f"×{info['factor']:.2f}",
-                      delta=f"range {ci[0]:.2f}–{ci[1]:.2f}" if ci else None, delta_color="off",
-                      help="Bootstrap 95% range over the overlap months.")
+            h1.metric(
+                "Scaling factor",
+                f"×{info['factor']:.2f}",
+                delta=f"range {ci[0]:.2f}–{ci[1]:.2f}" if ci else None,
+                delta_color="off",
+                help="Bootstrap 95% range over the overlap months.",
+            )
             h2.metric("Overlap months used", info["n_valid"])
-            h3.metric("Monthly correlation", "n/a" if np.isnan(info["corr"]) else f"{info['corr']:.2f}",
-                      help="Pearson r between MODIS and VIIRS monthly counts in the overlap.")
+            h3.metric(
+                "Monthly correlation",
+                "n/a" if np.isnan(info["corr"]) else f"{info['corr']:.2f}",
+                help="Pearson r between MODIS and VIIRS monthly counts in the overlap.",
+            )
             err = info["err_seasonal"] if scaling.startswith("By") else info["err_single"]
-            h4.metric("Median monthly error", "n/a" if np.isnan(err) else f"{err * 100:.0f}%",
-                      help="How far scaled MODIS lands from VIIRS in the overlap months.")
+            h4.metric(
+                "Median monthly error",
+                "n/a" if np.isnan(err) else f"{err * 100:.0f}%",
+                help="How far scaled MODIS lands from VIIRS in the overlap months.",
+            )
 
             v1, v2 = st.columns(2)
-            v1.metric("Out-of-sample error", "n/a" if np.isnan(info["err_loyo"]) else f"{info['err_loyo'] * 100:.0f}%",
-                      help="Leave-one-year-out: the factor is fitted on the other overlap years and "
-                           "used to predict each held-out year's VIIRS monthly counts.")
+            v1.metric(
+                "Out-of-sample error",
+                "n/a" if np.isnan(info["err_loyo"]) else f"{info['err_loyo'] * 100:.0f}%",
+                help="Leave-one-year-out: the factor is fitted on the other overlap years and "
+                "used to predict each held-out year's VIIRS monthly counts.",
+            )
             if trend_raw is not None and trend_h is not None:
-                v2.metric("Trend without vs with scaling",
-                          f"{trend_raw[0]:+.1f}% vs {trend_h[0]:+.1f}% / yr",
-                          help="Same area and years. Without scaling, the jump from MODIS to VIIRS "
-                               "shows up as a fake trend in the record.")
+                v2.metric(
+                    "Trend without vs with scaling",
+                    f"{trend_raw[0]:+.1f}% vs {trend_h[0]:+.1f}% / yr",
+                    help="Same area and years. Without scaling, the jump from MODIS to VIIRS "
+                    "shows up as a fake trend in the record.",
+                )
             else:
-                v2.metric("Trend without vs with scaling", "n/a",
-                          help="Needs at least five complete years in the selected range.")
+                v2.metric(
+                    "Trend without vs with scaling",
+                    "n/a",
+                    help="Needs at least five complete years in the selected range.",
+                )
 
             ov = info["overlap"]
             ovv = ov[ov["valid"]] if len(ov) else ov
             if len(ovv):
                 sc = go.Figure()
-                sc.add_trace(go.Scatter(
-                    x=ovv["MODIS"], y=ovv["VIIRS"], mode="markers",
-                    marker=dict(color=VIIRS_COLOR, size=7, opacity=0.8), name="Month",
-                    text=ovv["ym"].dt.strftime("%b %Y"),
-                    hovertemplate="%{text}<br>MODIS %{x:.0f}<br>VIIRS %{y:.0f}<extra></extra>",
-                ))
+                sc.add_trace(
+                    go.Scatter(
+                        x=ovv["MODIS"],
+                        y=ovv["VIIRS"],
+                        mode="markers",
+                        marker=dict(color=VIIRS_COLOR, size=7, opacity=0.82),
+                        name="Overlap month",
+                        text=ovv["ym"].dt.strftime("%b %Y"),
+                        hovertemplate="%{text}<br>MODIS %{x:.0f}<br>VIIRS %{y:.0f}<extra></extra>",
+                    )
+                )
                 xmax = float(ovv["MODIS"].max())
-                sc.add_trace(go.Scatter(
-                    x=[0, xmax], y=[0, xmax * info["factor"]], mode="lines",
-                    line=dict(color=OTHER_COLOR, dash="dash"), name=f"VIIRS = {info['factor']:.2f} × MODIS"))
+                sc.add_trace(
+                    go.Scatter(
+                        x=[0, xmax],
+                        y=[0, xmax * info["factor"]],
+                        mode="lines",
+                        line=dict(color=SAGE_COLOR, dash="dash", width=2),
+                        name=f"VIIRS = {info['factor']:.2f} × MODIS",
+                    )
+                )
                 sc.update_xaxes(title="MODIS monthly detections (per-satellite)")
                 sc.update_yaxes(title="VIIRS monthly detections")
                 show(tidy(sc, "Overlap months (whole file): MODIS against VIIRS", 360), "overlap")
@@ -1585,24 +2882,44 @@ The factor is calibrated on the whole file, so it stays stable when you zoom to 
             rm = info["raw_monthly"]
             rm = rm[(rm["ym"] >= pd.Timestamp(d0).to_period("M").start_time) & (rm["ym"] <= pd.Timestamp(d1))]
             if aoi_poly is None:
-                raw_year = (rm.assign(year=rm["ym"].dt.year)
-                            .groupby(["year", "sensor"], observed=True)["n"].sum().unstack(fill_value=0))
+                raw_year = (
+                    rm.assign(year=rm["ym"].dt.year)
+                    .groupby(["year", "sensor"], observed=True)["n"]
+                    .sum()
+                    .unstack(fill_value=0)
+                )
                 cmp_ = go.Figure()
                 if "MODIS" in raw_year:
-                    cmp_.add_scatter(x=raw_year.index, y=raw_year["MODIS"], mode="lines+markers", name="MODIS, raw",
-                                     line=dict(color=MODIS_COLOR, width=1.5, dash="dot"), marker=dict(size=4))
+                    cmp_.add_scatter(
+                        x=raw_year.index,
+                        y=raw_year["MODIS"],
+                        mode="lines+markers",
+                        name="MODIS, raw",
+                        line=dict(color=MODIS_COLOR, width=1.5, dash="dot"),
+                        marker=dict(size=4),
+                    )
                 if "VIIRS" in raw_year:
-                    cmp_.add_scatter(x=raw_year.index, y=raw_year["VIIRS"], mode="lines+markers",
-                                     name="VIIRS, raw (all satellites)",
-                                     line=dict(color=VIIRS_COLOR, width=1.5, dash="dot"), marker=dict(size=4))
-                cmp_.add_scatter(x=annual_total.index, y=annual_total.to_numpy(), mode="lines+markers",
-                                 name="Harmonized", line=dict(color="#e8e8e8", width=3), marker=dict(size=6))
+                    cmp_.add_scatter(
+                        x=raw_year.index,
+                        y=raw_year["VIIRS"],
+                        mode="lines+markers",
+                        name="VIIRS, raw (all satellites)",
+                        line=dict(color=VIIRS_COLOR, width=1.5, dash="dot"),
+                        marker=dict(size=4),
+                    )
+                cmp_.add_scatter(
+                    x=annual_total.index,
+                    y=annual_total.to_numpy(),
+                    mode="lines+markers",
+                    name="Harmonized",
+                    line=dict(color="#f4f0e6", width=2.8),
+                    marker=dict(size=6),
+                )
                 cmp_.update_xaxes(dtick=2)
                 cmp_.update_yaxes(title="detections / year")
                 show(tidy(cmp_, "Before and after: the raw records against the harmonized series"), "beforeafter")
             else:
-                st.caption("The raw-sensor comparison is shown for the whole region. "
-                           "Choose Whole region to see it.")
+                st.caption("The raw-sensor comparison is shown for the whole region. Choose Whole region to see it.")
 
             by_plat = rm.groupby(["ym", "platform"], observed=True)["n"].sum().unstack(fill_value=0)
             if len(by_plat):
@@ -1614,8 +2931,10 @@ The factor is calibrated on the whole file, so it stays stable when you zoom to 
                 )
 
             if scaling.startswith("By"):
-                tbl = pd.DataFrame({"Month": [calendar.month_abbr[mo] for mo in range(1, 13)],
-                                    "MODIS to VIIRS factor": [round(info["seasonal_map"][mo], 2) for mo in range(1, 13)]})
+                tbl = pd.DataFrame({
+                    "Month": [calendar.month_abbr[mo] for mo in range(1, 13)],
+                    "MODIS to VIIRS factor": [round(info["seasonal_map"][mo], 2) for mo in range(1, 13)],
+                })
                 with st.expander("Monthly scaling factors"):
                     st.dataframe(tbl, hide_index=True)
 
@@ -1630,7 +2949,9 @@ The factor is calibrated on the whole file, so it stays stable when you zoom to 
         mt["complete_month"] = [bool(full.loc[y, mo]) for y, mo in zip(mt["year"], mt["month"])]
         mt["anomaly_pct"] = np.where(
             mt["complete_month"] & (mt["median_same_month"] > 0),
-            (mt["detections_viirs_equiv"] - mt["median_same_month"]) / mt["median_same_month"] * 100, np.nan)
+            (mt["detections_viirs_equiv"] - mt["median_same_month"]) / mt["median_same_month"] * 100,
+            np.nan,
+        )
         mt = mt.round({"detections_viirs_equiv": 1, "median_same_month": 1, "anomaly_pct": 1})
 
         report = [
@@ -1650,58 +2971,88 @@ The factor is calibrated on the whole file, so it stays stable when you zoom to 
                 + (f" (bootstrap range {ci[0]:.2f}-{ci[1]:.2f})" if ci else "")
                 + f" from {info['n_valid']} overlap months; first full VIIRS month {info['split']:%B %Y}",
                 f"- Overlap correlation r = {info['corr']:.2f}; leave-one-year-out error "
-                f"{info['err_loyo'] * 100:.0f}%" if not np.isnan(info["corr"]) and not np.isnan(info["err_loyo"])
+                f"{info['err_loyo'] * 100:.0f}%"
+                if not np.isnan(info["corr"]) and not np.isnan(info["err_loyo"])
                 else "- Overlap statistics unavailable for this file",
             ]
         if status is not None:
-            report += ["", "## Current period",
-                       f"{calendar.month_name[lm]} 1-{last_day}, {ly}: {current:,.0f} detections against a median of "
-                       f"{status['median']:,.0f} for the same days in {len(hist)} earlier years "
-                       f"({ordinal(status['rank'])} highest of {status['n']}; {status['label']})."]
+            report += [
+                "",
+                "## Current period",
+                f"{calendar.month_name[lm]} 1-{last_day}, {ly}: {current:,.0f} detections against a median of "
+                f"{status['median']:,.0f} for the same days in {len(hist)} earlier years "
+                f"({ordinal(status['rank'])} highest of {status['n']}; {status['label']}).",
+            ]
+        if field_notes:
+            report += ["", "## Field notes"] + [f"- **{n['tag']}** — {n['head']}: {n['body']}" for n in field_notes]
         if trend_h is not None:
             report += ["", f"Annual trend over {len(full_years)} complete years: {trend_h[0]:+.1f}% per year (Theil-Sen)."]
         if not flat.empty:
             report += ["", "## Most active months"] + [
-                f"- {calendar.month_abbr[int(r.month)]} {int(r.year)}: {r.n:,.0f}" for r in flat.nlargest(5, "n").itertuples()]
+                f"- {calendar.month_abbr[int(r.month)]} {int(r.year)}: {r.n:,.0f}"
+                for r in flat.nlargest(5, "n").itertuples()
+            ]
         report += ["", "Source: NASA FIRMS active-fire detections (MODIS Terra/Aqua, VIIRS SNPP/NOAA-20/NOAA-21)."]
         report_txt = "\n".join(report)
 
         stem = slug(match, canon) + ("_aoi" if aoi_poly is not None else "")
         d1c, d2c, d3c = st.columns(3)
-        d1c.download_button("Hotspots (CSV)", to_csv(key, sub), file_name=f"{stem}_hotspots.csv", mime="text/csv",
-                            help="Every detection in the current area and period, with sensor, satellite and "
-                                 "the VIIRS-equivalent weight.")
-        d2c.download_button("Monthly series with anomalies (CSV)", mt.to_csv(index=False).encode(),
-                            file_name=f"{stem}_monthly.csv", mime="text/csv")
-        d3c.download_button("Summary (Markdown)", report_txt.encode(), file_name=f"{stem}_summary.md",
-                            mime="text/markdown")
+        d1c.download_button(
+            "Hotspots (CSV)",
+            to_csv(key, sub),
+            file_name=f"{stem}_hotspots.csv",
+            mime="text/csv",
+            help="Every detection in the current area and period, with sensor, satellite and VIIRS-equivalent weight.",
+        )
+        d2c.download_button(
+            "Monthly series with anomalies (CSV)",
+            mt.to_csv(index=False).encode(),
+            file_name=f"{stem}_monthly.csv",
+            mime="text/csv",
+        )
+        d3c.download_button(
+            "Field report (Markdown)",
+            report_txt.encode(),
+            file_name=f"{stem}_summary.md",
+            mime="text/markdown",
+        )
         if aoi_poly is not None:
-            st.download_button("Area of interest (GeoJSON)",
-                               json.dumps({"type": "Feature", "properties": {}, "geometry": mapping(aoi_poly)}).encode(),
-                               file_name=f"{stem}.geojson", mime="application/geo+json")
+            st.download_button(
+                "Area of interest (GeoJSON)",
+                json.dumps({"type": "Feature", "properties": {}, "geometry": mapping(aoi_poly)}).encode(),
+                file_name=f"{stem}.geojson",
+                mime="application/geo+json",
+            )
         st.dataframe(mt, hide_index=True)
 
 else:
-    render_map(None)
+    render_map(None, height=540)
     if match is None:
-        st.markdown("&nbsp;", unsafe_allow_html=True)
-        s1, s2, s3 = st.columns(3, gap="large")
-        for col, head, body in (
-            (s1, "1. Choose a region",
-             "Search for a country in the sidebar. Those marked “data loaded” already have a hotspot file."),
-            (s2, "2. Zoom in on your area",
-             "Draw a shape on the map or type coordinates to look at a province, a park or a stretch of farmland."),
-            (s3, "3. Read the calendar",
-             "See which months and years burned the most, and whether this month looks unusual."),
-        ):
-            col.markdown(f'<div class="step"><b>{head}</b><p>{body}</p></div>', unsafe_allow_html=True)
-        avail = sorted(x.replace("_", " ").title() for x in stems)
-        if avail:
-            st.markdown(f'<p class="note" style="margin-top:1.2rem">Ready to explore: {", ".join(avail)}.</p>',
-                        unsafe_allow_html=True)
+        loaded_keys = sorted(k for k in regions if has_data(k) and k not in ALIASES)
+        if loaded_keys:
+            lc1, lc2 = st.columns([4, 1], gap="medium")
+            lc1.markdown(
+                '<div class="landing-caption">'
+                "<span>Click any highlighted country on the map or jump directly into a loaded archive below. "
+                "Inside any region, draw a polygon or enter coordinates to inspect a park, province, or watershed.</span>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+            if len(loaded_keys) > 1 and lc2.button("Random region", key="rand_region", use_container_width=True):
+                st.session_state["region_pick"] = random.choice(loaded_keys)
+                st.rerun()
+
+            btn_cols = st.columns(min(len(loaded_keys), 6))
+            for idx, rk in enumerate(loaded_keys):
+                if btn_cols[idx % len(btn_cols)].button(rk.title(), key=f"quick_{rk}", use_container_width=True):
+                    st.session_state["region_pick"] = rk
+                    st.rerun()
         else:
-            st.markdown('<p class="note" style="margin-top:1.2rem">No hotspot files found yet. '
-                        "Add a FIRMS download to the data folder to get started.</p>", unsafe_allow_html=True)
+            st.markdown(
+                '<p class="note" style="margin-top:.85rem">Search for any country in the sidebar, and place '
+                "FIRMS archive CSV or Parquet files in <code>data/</code> to light them up on the map.</p>",
+                unsafe_allow_html=True,
+            )
 
 st.markdown(
     '<div class="credits">Fire detections come from NASA FIRMS (MODIS and VIIRS). Country boundaries are from '
