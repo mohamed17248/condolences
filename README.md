@@ -12,12 +12,6 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Put one FIRMS archive download per region in a `data/` folder next to `app.py`, named after the
-region: `data/egypt.csv` or `data/egypt.parquet`. Get the files from the FIRMS archive download
-tool (https://firms.modaps.eosdis.nasa.gov/download/), requesting both the MODIS and the VIIRS
-products for the same country and merging them into one file. The app also needs
-`ne_countries.geojson` (Natural Earth 110m countries) next to `app.py`.
-
 Required columns: `latitude`, `longitude`, `acq_date`. Used when present: `satellite`,
 `instrument`, `confidence`, `type`, `acq_time`, `brightness` (MODIS), `bright_ti4` (VIIRS).
 
