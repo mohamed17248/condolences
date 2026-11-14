@@ -76,5 +76,5 @@ Required columns: `latitude`, `longitude`, `acq_date`. Used when present: `satel
 
 ## Contributors
 
-- queriesonhold (Ahmed sultan)
+- queriesonhold/egobreaking (Ahmed sultan)
 - mohamed17248 (Mohamed abbas)
