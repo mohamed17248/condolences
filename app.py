@@ -1182,11 +1182,11 @@ MAP_LEGEND_STYLE = (
 def base_map(style: str) -> folium.Map:
     m = folium.Map(
         location=[18, 12],
-        zoom_start=3,
+        zoom_start=2,
         control_scale=True,
         prefer_canvas=True,
         tiles=None,
-        min_zoom=3,
+        min_zoom=2,
         max_zoom=16,
         # Keep the viewport inside the world so panning can't drift into the
         # grey void left of/right of the dateline.
