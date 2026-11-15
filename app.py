@@ -1186,7 +1186,7 @@ def base_map(style: str) -> folium.Map:
         control_scale=True,
         prefer_canvas=True,
         tiles=None,
-        min_zoom=2,
+        min_zoom=3,
         max_zoom=16,
         # Keep the viewport inside the world so panning can't drift into the
         # grey void left of/right of the dateline.
