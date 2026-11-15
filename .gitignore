@@ -1,5 +1,16 @@
 __pycache__/
 *.pyc
-data/
+data/*
 data_release/
 *.log
+!data/egypt.parquet
+!data/greece.parquet
+!data/portugal.parquet
+!data/spain.parquet
+!data/italy.parquet
+!data/france.parquet
+!data/turkey.parquet
+!data/south_africa.parquet
+!data/kenya.parquet
+!data/chile.parquet
+!data/indonesia.parquet
