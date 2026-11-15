@@ -1191,7 +1191,8 @@ def base_map(style: str) -> folium.Map:
     )
     cfg = TILES[style]
     if cfg:
-        folium.TileLayer(tiles=cfg["tiles"], attr=cfg["attr"], name=style, max_zoom=16).add_to(m)
+        folium.TileLayer(tiles=cfg["tiles"], attr=cfg["attr"], name=style, max_zoom=16,
+                         no_wrap=True).add_to(m)
     else:
         m.get_root().html.add_child(
             folium.Element("<style>.leaflet-container{background:#0c0d0b!important}</style>")
