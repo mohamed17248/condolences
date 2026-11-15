@@ -94,8 +94,8 @@ and the current `fire-app-final` / `nasa-space-app-mohamed-abbas` version.
   land-cover join.
 - Launch dates are approximate to ~a month.
 
-- The last change:
-- Fixes applied
+
+## Fixes applied
 
 Year tab crash. The verdicts use the whole archive, but the chart only had the slider’s window. The year tab now reads the archive’s own monthly tables, so picking 2005 with the slider on 2018–2025 works. I confirmed that a narrow window still gives all 26 verdicts.
 Confidence filter. It no longer crashes on a file where every row has the same confidence value. I tested this case ;p.
@@ -106,4 +106,5 @@ Region selector. index=None is back on the region selectbox.
 Rating threshold. It is now four complete years everywhere, in one constant.
 Tab name. “Predict & sources” is now “Recent activity & sources”.
 A bug in the alert-days table. Every date showed 2021. It now shows the real year, for example “05 Apr 2010”.
-@queriesonhold@gmail.com for more info
+
+# @queriesonhold@gmail.com for more info.
