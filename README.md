@@ -1,5 +1,8 @@
 # Fire Activity Explorer
 
+> See [CHANGELOG.md](CHANGELOG.md) for everything added, changed, and fixed
+> relative to the original prototype.
+
 A web app that harmonizes NASA FIRMS active-fire detections from MODIS (Terra, Aqua; 2000 on)
 and VIIRS (SNPP, NOAA-20, NOAA-21; 2012 on) into one consistent record, and presents it as a
 burning-activity calendar for any area of interest. Built for the NASA Space Apps Challenge,
