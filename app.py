@@ -153,6 +153,7 @@ WANTED = {
 from firecore import (
     MODIS_PLATFORMS,
     VIIRS_PLATFORMS,
+    YEAR_LEVELS,
     level_for,
     normalize_platform,
     ordinal,
@@ -2125,9 +2126,15 @@ if sub is not None:
     trend_raw = rel_trend(annual_raw, full_years)
     # Honesty check: a trend fitted only on VIIRS-era years does not depend on
     # the MODIS->VIIRS scaling factor at all.
+    # The split year itself still contains scaled MODIS months, so start the
+    # VIIRS-only trend strictly after it to stay independent of the factor.
+    first_clean = (
+        info["split"].year + (1 if info["split"].month > 1 else 0)
+        if info["split"] is not None else None
+    )
     viirs_years = [
         y for y in full_years
-        if info["split"] is not None and y >= info["split"].year
+        if first_clean is not None and y >= first_clean
     ]
     trend_viirs = rel_trend(annual_total, viirs_years)
     # FIRMS tails are near-real-time for roughly the last ~3-4 months.
@@ -3543,7 +3550,7 @@ if sub is not None:
 
     else:
         key = (match, str(d0), str(d1), drop_low, veg_only, viirs_mode, scaling, int(min_monthly),
-               round(path.stat().st_mtime, 1), aoi_key)
+               int(calib_year), round(path.stat().st_mtime, 1), aoi_key)
         mt = (
             sub.groupby(["year", "month"])
             .agg(detections_viirs_equiv=("weight", "sum"), raw_detections=("weight", "size"),

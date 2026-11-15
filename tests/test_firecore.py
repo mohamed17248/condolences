@@ -16,6 +16,8 @@ from firecore import (  # noqa: E402
     normalize_platform,
     ordinal,
     rel_trend,
+    short_text,
+    size_text,
     status_for,
     theil_sen,
 )
@@ -48,6 +50,9 @@ def test_normalize_platform_categorical():
     s = pd.Series(["N", "T", "1"]).astype("category")
     out = normalize_platform(s)
     assert out.tolist() == ["SNPP", "Terra", "NOAA-20"]
+    # categorical and plain-string paths must agree
+    plain = normalize_platform(pd.Series(["N", "T", "1"]))
+    assert [str(v) for v in out] == [str(v) for v in plain]
 
 
 def test_status_for_buckets():
@@ -80,6 +85,14 @@ def test_rel_trend_min_years():
 def test_ordinal():
     assert ordinal(1) == "1st" and ordinal(2) == "2nd" and ordinal(3) == "3rd"
     assert ordinal(4) == "4th" and ordinal(11) == "11th" and ordinal(21) == "21st"
+    assert ordinal(12) == "12th" and ordinal(23) == "23rd"
+
+
+def test_size_text():
+    assert size_text(2.5) == "2.5× the usual year"
+    assert size_text(1.0) == "right at the usual year"
+    assert size_text(None) == "with no baseline year to compare"
+    assert short_text(1.6) == "+60% vs usual"
 
 
 if __name__ == "__main__":
