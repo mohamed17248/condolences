@@ -12,7 +12,6 @@ import calendar
 import hashlib
 import inspect
 import json
-import random
 import re
 import unicodedata
 from html import escape
@@ -147,7 +146,7 @@ OVERRIDES = {
 
 WANTED = {
     "latitude", "longitude", "acq_date", "acq_time", "satellite", "instrument",
-    "confidence", "brightness", "bright_ti4", "type",
+    "confidence", "brightness", "bright_ti4", "type", "frp",
 }
 
 PLATFORM_MAP = {
@@ -181,7 +180,7 @@ def infer_sensor(df: pd.DataFrame, platform: pd.Series) -> pd.Series:
     return sensor
 
 
-@st.cache_data(show_spinner="Reading hotspot archive…")
+@st.cache_resource
 def read_file(path_str: str, mtime: float):
     path = Path(path_str)
     if path.suffix.lower() == ".parquet":
@@ -214,10 +213,12 @@ def read_file(path_str: str, mtime: float):
         lowconf = (pd.to_numeric(c, errors="coerce") < 30) | c.isin(["l", "low"])
 
     # FIRMS type: 0 = vegetation fire, 1-3 = volcano / industrial / offshore
+    firms_type = pd.Series(np.nan, index=df.index, dtype="float32")
     nonveg = pd.Series(False, index=df.index)
     if "type" in df:
         t = pd.to_numeric(df["type"], errors="coerce")
         nonveg = t.notna() & (t != 0)
+        firms_type = t.astype("float32")
 
     # Convert UTC acq_time + longitude into approximate local solar hour (0..23, -1 if missing)
     local_hour = np.full(len(df), -1, dtype=np.int8)
@@ -231,6 +232,13 @@ def read_file(path_str: str, mtime: float):
             solar = np.floor((hh + mm / 60.0 + lon / 15.0) % 24.0).astype(np.int8)
             local_hour[valid_t.to_numpy()] = solar
 
+    frp = (
+        pd.to_numeric(df["frp"], errors="coerce")
+        if "frp" in df
+        else pd.Series(0.0, index=df.index)
+    )
+    frp = frp.clip(lower=0).fillna(0).astype("float32")
+
     out = pd.DataFrame({
         "latitude": df["latitude"].astype("float32"),
         "longitude": df["longitude"].astype("float32"),
@@ -240,6 +248,8 @@ def read_file(path_str: str, mtime: float):
         "local_hour": local_hour,
         "lowconf": lowconf.to_numpy(),
         "nonveg": nonveg.to_numpy(),
+        "firms_type": firms_type.to_numpy(),
+        "frp": frp.to_numpy(),
     }).reset_index(drop=True)
     flags = {
         "has_conf": "confidence" in df,
@@ -249,11 +259,12 @@ def read_file(path_str: str, mtime: float):
         "n_raw": len(out),
         "n_nonveg_total": int(nonveg.sum()),
         "n_lowconf_total": int(lowconf.sum()),
+        "has_frp": bool((frp > 0).any()),
     }
     return out, flags
 
 
-@st.cache_data(show_spinner="Calibrating MODIS and VIIRS records…")
+@st.cache_resource(show_spinner="Calibrating MODIS and VIIRS records…")
 def build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly):
     raw, flags = read_file(path_str, mtime)
     first_seen = raw.groupby("platform", observed=True)["acq_date"].min()
@@ -387,6 +398,9 @@ def build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min
         )
 
     df["weight"] = df["w0"].to_numpy() * f
+    # FRP is fire intensity (MW), not a detection count: average it across the
+    # active constellation via w0 but do not apply the MODIS->VIIRS rate factor.
+    df["frp_w"] = df["frp"].to_numpy(float) * df["w0"].to_numpy(float)
     df = df[keep].drop(columns=["w0"])
     df["year"] = df["acq_date"].dt.year
     df["month"] = df["acq_date"].dt.month
@@ -436,12 +450,7 @@ def drawing_to_polygon(feat):
 
 
 def _contains_xy(poly, x, y):
-    try:
-        return shapely.contains_xy(poly, x, y)
-    except AttributeError:
-        # shapely < 2.0 fallback
-        from shapely import vectorized
-        return vectorized.contains(poly, x, y)
+    return shapely.contains_xy(poly, x, y)
 
 
 def apply_aoi(df: pd.DataFrame, poly) -> pd.DataFrame:
@@ -501,7 +510,7 @@ def level_for(ratio):
 
 def size_text(ratio, unit="the usual year"):
     if ratio is None:
-        return "against a usual of none"
+        return "with no baseline year to compare"
     if ratio >= 2:
         return f"{ratio:.1f}× {unit}"
     if ratio >= 1.05:
@@ -527,10 +536,132 @@ def short_text(ratio):
     return f"{ratio:.1f}× usual" if ratio >= 2 else f"{(ratio - 1) * 100:+.0f}% vs usual"
 
 
+@st.cache_data(show_spinner=False)
+def archive_year_stats(path_str, mtime, aoi_wkt, drop_low, veg_only, viirs_mode, seasonal, min_monthly):
+    """Year-verdict stats over the whole cleaned archive, ignoring the date
+    slider, so the annual stripes stay meaningful for short windows."""
+    hot, _ = build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly)
+    arch = apply_aoi(hot, shapely_wkt.loads(aoi_wkt)) if aoi_wkt else hot
+    if arch.empty:
+        return None
+    first_y, last_y = int(arch["year"].min()), int(arch["year"].max())
+    years = list(range(first_y, last_y + 1))
+    ad0, ad1 = arch["acq_date"].min(), arch["acq_date"].max()
+    tol = pd.Timedelta(days=3)
+
+    monthly = arch.groupby(["year", "month"])["weight"].sum()
+    pivot = monthly.unstack("month").reindex(index=years, columns=range(1, 13))
+    full = pd.DataFrame(False, index=pivot.index, columns=pivot.columns)
+    for y in pivot.index:
+        for mo in pivot.columns:
+            s = pd.Timestamp(y, mo, 1)
+            e = s + pd.offsets.MonthEnd(0)
+            full.loc[y, mo] = (s + tol >= ad0) and (e - tol <= ad1)
+    pivot_full = pivot.fillna(0).where(full)
+    med_by_month = pivot_full.median()
+    full_years = [y for y in years if full.loc[y].all()]
+
+    abs_year = (
+        arch.groupby(["year", "sensor"], observed=True)["weight"]
+        .sum().unstack(fill_value=0).reindex(years, fill_value=0)
+    )
+    annual_total = abs_year.sum(axis=1)
+    modis_share = (
+        (abs_year["MODIS"] / annual_total)
+        if "MODIS" in abs_year
+        else pd.Series(0.0, index=annual_total.index)
+    )
+
+    latest = arch["acq_date"].max()
+    aly, alm, ald = latest.year, latest.month, latest.day
+    ytd = None
+    past_full = [y for y in full_years if y < aly]
+    if aly not in full_years and len(past_full) >= 3:
+        upto = (arch["month"] < alm) | ((arch["month"] == alm) & (arch["acq_date"].dt.day <= ald))
+        yb = arch[upto].groupby("year")["weight"].sum()
+        ytd = dict(year=aly, cur=float(yb.get(aly, 0.0)),
+                   hist=yb.reindex(past_full, fill_value=0.0),
+                   label=f"{calendar.month_abbr[alm]} {ald}")
+
+    verdicts = year_verdicts(annual_total, modis_share, pivot, full_years, med_by_month, ytd)
+    baseline = float(annual_total.loc[full_years].median()) if len(full_years) >= 3 else None
+    return verdicts, baseline
+
+
+@st.cache_data(show_spinner=False)
+def archive_alert_days(path_str, mtime, aoi_wkt, drop_low, veg_only, viirs_mode, seasonal, min_monthly):
+    """Days whose activity ran far above the same day-of-year in other years.
+    Archive-scoped like archive_year_stats so short windows still get alerts."""
+    hot, _ = build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly)
+    arch = apply_aoi(hot, shapely_wkt.loads(aoi_wkt)) if aoi_wkt else hot
+    if arch.empty:
+        return None
+
+    first_y, last_y = int(arch["year"].min()), int(arch["year"].max())
+    years = list(range(first_y, last_y + 1))
+    ad0, ad1 = arch["acq_date"].min(), arch["acq_date"].max()
+    tol = pd.Timedelta(days=3)
+
+    monthly = arch.groupby(["year", "month"])["weight"].sum()
+    pivot = monthly.unstack("month").reindex(index=years, columns=range(1, 13))
+    full = pd.DataFrame(False, index=pivot.index, columns=pivot.columns)
+    for y in pivot.index:
+        for mo in pivot.columns:
+            s = pd.Timestamp(y, mo, 1)
+            e = s + pd.offsets.MonthEnd(0)
+            full.loc[y, mo] = (s + tol >= ad0) and (e - tol <= ad1)
+    full_years = [y for y in years if full.loc[y].all()]
+    if len(full_years) < 3:
+        return None
+
+    doy = arch["acq_date"].dt.dayofyear.clip(upper=365)
+    daily = (
+        arch.assign(doy=doy)
+        .groupby(["year", "doy"])["weight"]
+        .sum()
+        .unstack("doy")
+        .reindex(index=years, columns=range(1, 366), fill_value=0.0)
+    )
+
+    latest = arch["acq_date"].max()
+    aly = int(latest.year)
+    aly_doy = int(min(latest.dayofyear, 365))
+    cand_years = list(full_years)
+    if aly not in full_years:
+        cand_years.append(aly)
+
+    rows = []
+    for y in cand_years:
+        others = [o for o in full_years if o != y]
+        if not others or y not in daily.index:
+            continue
+        med = daily.loc[others].median()
+        vals = daily.loc[y]
+        lim = aly_doy if (y == aly and y not in full_years) else 365
+        v, m = vals.iloc[:lim], med.iloc[:lim]
+        mask = (v >= 10) & (m > 0) & (v >= 2.0 * m)
+        for d in np.nonzero(mask.to_numpy())[0]:
+            rows.append(dict(year=y, doy=int(d) + 1,
+                             detections=float(v.iloc[d]), usual=float(m.iloc[d])))
+    if not rows:
+        return None
+
+    out = pd.DataFrame(rows)
+    out["date"] = pd.to_datetime("2021-01-01") + pd.to_timedelta(out["doy"] - 1, unit="D")
+    out["ratio"] = out["detections"] / out["usual"]
+    out["excess"] = out["detections"] - out["usual"]
+    out = out.sort_values("excess", ascending=False).head(12)
+    out["Date"] = out["date"].dt.strftime("%d %b %Y")
+    out["Detections"] = out["detections"].round(0).astype(int)
+    out["Usual for that day"] = out["usual"].round(0).astype(int)
+    out["Times usual"] = out["ratio"].round(1).map(lambda r: f"{r:.1f}×")
+    return out[["Date", "Detections", "Usual for that day", "Times usual"]]
+
+
 def year_verdicts(annual_total, modis_share, pivot_cov, full_years, med_by_month, ytd=None):
     years = sorted(int(y) for y in annual_total.index)
     full = [y for y in full_years if y in annual_total.index]
-    rated = len(full) >= 4
+    rated = len(full) >= 3
     baseline = float(annual_total.loc[full].median()) if rated else None
     has_clim = bool(med_by_month.notna().any()) and float(med_by_month.max()) > 0
     typ_peak = int(med_by_month.idxmax()) if has_clim else None
@@ -655,7 +786,7 @@ def years_summary(vs, region_text, baseline):
     return text
 
 
-def derive_field_notes(sub: pd.DataFrame, med_by_month: pd.Series, info: dict, verdicts: list, region_text: str):
+def derive_field_notes(sub: pd.DataFrame, med_by_month: pd.Series, info: dict, verdicts: list, region_text: str, veg_only: bool = True):
     """Synthesize plain-English fire regime clues, diurnal clock stats, and archive records from live data."""
     notes = []
     tot_w = float(sub["weight"].sum())
@@ -689,14 +820,15 @@ def derive_field_notes(sub: pd.DataFrame, med_by_month: pd.Series, info: dict, v
     top_cells_n = max(1, int(np.ceil(len(g) * 0.10)))
     spatial_conc = float(g.iloc[:top_cells_n].sum() / g.sum()) if len(g) > 0 else 0.0
 
-    # VIIRS catches tiny ag burns MODIS misses, so factor > 3 + sharp window usually means crop stubble
+    # Heuristic only: VIIRS catches tiny burns MODIS misses, so a high factor plus a
+    # sharp seasonal window is *consistent with* crop-residue burning, not proof of it.
     if info.get("has_both") and factor >= 3.2 and top2_share >= 0.50:
-        driver_tag = "Likely crop-residue burning"
+        driver_tag = "Heuristic: likely crop-residue burning"
         driver_head = "Small, brief fires clustered around harvest windows"
         driver_body = (
             f"VIIRS picks up {factor:.1f}× more hotspots here than 1 km MODIS, and {top2_share * 100:.0f}% "
-            f"of typical annual burning lands in just two peak months. That combination is the classic "
-            f"orbital signature of post-harvest agricultural stubble clearing rather than large forest fires."
+            f"of typical annual burning lands in just two peak months — a pattern consistent with "
+            f"post-harvest agricultural stubble clearing, though other small-fire regimes can look similar."
         )
     elif bimodal_pair is not None:
         driver_tag = "Two-season burn cycle"
@@ -743,20 +875,21 @@ def derive_field_notes(sub: pd.DataFrame, med_by_month: pd.Series, info: dict, v
         peak_hr = int(np.argmax(by_hr))
         day_share = float(by_hr[6:18].sum() / by_hr.sum())
         night_share = 1.0 - day_share
+        # This histogram mostly reflects fixed satellite overpass times, not fire behaviour.
         if night_share >= 0.28:
-            clock_tag = "High overnight persistence"
-            clock_head = f"{night_share * 100:.0f}% of detections occur after dark"
+            clock_tag = "Overpass diagnostic: night-weighted"
+            clock_head = f"{night_share * 100:.0f}% of weight sits in the 18:00–06:00 window"
             clock_body = (
-                f"Activity peaks around {peak_hr:02d}:00 local solar time, yet {night_share * 100:.0f}% of "
-                f"detections happen between 18:00 and 06:00—often a sign of deep-burning peat/forest fires "
-                f"that hold heat overnight, or industrial flares if non-vegetation filtering is off."
+                f"MODIS and VIIRS only observe at fixed sun-synchronous times (~10:30/13:30 and "
+                f"~22:30/01:30 local), so this mostly tracks which overpasses see more fire, not when "
+                f"fires actually burn. Treat night weighting as a sensor-geometry artefact."
             )
         else:
-            clock_tag = "Afternoon solar peak"
-            clock_head = f"{day_share * 100:.0f}% of burning happens in daylight, peaking at {peak_hr:02d}:00"
+            clock_tag = "Overpass diagnostic: day-weighted"
+            clock_head = f"{day_share * 100:.0f}% of weight sits in the 06:00–18:00 window"
             clock_body = (
-                f"Hotspots cluster strongly during warm afternoon hours (local solar time), when humidity drops "
-                f"and land-clearing burns are actively lit—matching sun-synchronous afternoon satellite passes."
+                f"As with the night-weighted case, the 06:00–18:00 share largely reflects the fixed "
+                f"afternoon overpass schedule of the constellation rather than real diurnal fire behaviour."
             )
         notes.append(dict(key="clock", tag=clock_tag, head=clock_head, body=clock_body))
 
@@ -798,12 +931,12 @@ def derive_field_notes(sub: pd.DataFrame, med_by_month: pd.Series, info: dict, v
     flags = info.get("flags", {})
     n_nonveg = int(flags.get("n_nonveg_total", 0))
     first_seen = info.get("first_seen", {})
-    if n_nonveg > 0:
+    if veg_only and n_nonveg > 0:
         orb_tag = "Static heat masked"
         orb_head = f"{fmt(n_nonveg)} non-vegetation heat sources filtered out"
         orb_body = (
             f"NASA's FIRMS classifier flagged {fmt(n_nonveg)} static thermal anomalies in this archive "
-            f"(gas flares, cement kilns, smelters, or volcanic vents) and separated them from landscape fires."
+            f"(gas flares, cement kilns, smelters, or volcanic vents); the vegetation-only filter removed them."
         )
     elif "Terra" in first_seen and "SNPP" in first_seen:
         orb_tag = "Orbital handoff"
@@ -819,8 +952,9 @@ def derive_field_notes(sub: pd.DataFrame, med_by_month: pd.Series, info: dict, v
         orb_tag = "Orbital geometry"
         orb_head = f"Sun-synchronous passes at {abs(lat_mid):.1f}° {'N' if lat_mid >= 0 else 'S'}"
         orb_body = (
-            f"Polar-orbiting MODIS and VIIRS instruments cross this {hemi}-Hemisphere latitude twice daily per "
-            f"satellite—once in early afternoon and once after midnight—capturing active flame fronts from 700+ km up."
+            f"Polar-orbiting MODIS and VIIRS instruments cross this {hemi}-Hemisphere latitude on fixed "
+            f"sun-synchronous schedules (Terra ~10:30/22:30, Aqua & VIIRS ~13:30/01:30 local), capturing "
+            f"active flame fronts from 700+ km up."
         )
     notes.append(dict(key="orbital", tag=orb_tag, head=orb_head, body=orb_body))
     return notes
@@ -947,6 +1081,8 @@ def stripe_color(ratio):
 
 
 def render_stripes(vs, title="Every year at a glance", active_year=None):
+    if not vs:
+        return
     cells = []
     for v in vs:
         bg = stripe_color(v["ratio"]) if v["ratio"] is not None else "#21241f"
@@ -1751,17 +1887,29 @@ def region_label(key: str) -> str:
 
 
 # Sidebar controls
+_pending_region = st.session_state.pop("_pending_region", None)
+if _pending_region is not None:
+    st.session_state["region_pick"] = _pending_region
+st.session_state.setdefault("region_pick", None)
+
 sb = st.sidebar
 sb.markdown('<div class="sb-label top">Region</div>', unsafe_allow_html=True)
 match = sb.selectbox(
     "Region",
     sorted(regions),
-    index=None,
     format_func=region_label,
     placeholder="Type any country or territory…",
     label_visibility="collapsed",
     key="region_pick",
 )
+if match is not None:
+    # _land_obj is a per-map click signature that must persist so stale
+    # component values can't replay when returning to a previous map.
+    st.session_state["_had_region"] = True
+elif st.session_state.pop("_had_region", False):
+    # Returning to the world map: bump the epoch so the Folium component
+    # remounts with a clean slate — st_folium's click values are sticky.
+    st.session_state["_map_epoch"] = st.session_state.get("_map_epoch", 0) + 1
 bbox = regions[match] if match else None
 match_title = match.title() if match else ""
 
@@ -1923,10 +2071,14 @@ elif stems:
         f"</div>"
     )
 
+_span_txt = "Decades of satellite fire detections"
+if sub is not None and "year" in sub and len(sub):
+    _sy = int(sub["year"].max()) - int(sub["year"].min()) + 1
+    _span_txt = f"{_sy} year{'' if _sy == 1 else 's'} of satellite fire detections"
 st.markdown(
     f'<div class="masthead">'
     f"<div><h1>Fire Activity Explorer</h1>"
-    f'<p class="sub">Twenty-five years of satellite fire detections calibrated across MODIS and VIIRS, '
+    f'<p class="sub">{_span_txt} calibrated across MODIS and VIIRS, '
     f"so any month, country, or custom polygon can be read against its historical baseline.</p></div>"
     f"{telemetry_html}"
     f"</div>",
@@ -1936,6 +2088,8 @@ st.markdown(
 # Compute statistics for active selection
 status = None
 field_notes = []
+alert_days = None
+has_frp = False
 if sub is not None:
     lo, hi, tol = pd.Timestamp(d0), pd.Timestamp(d1), pd.Timedelta(days=3)
     first_y, last_y = int(sub["year"].min()), int(sub["year"].max())
@@ -1955,9 +2109,12 @@ if sub is not None:
     pivot_full = pivot.fillna(0).where(full)
     med_by_month = pivot_full.median()
 
-    annual_by_sensor = sub.groupby(["year", "sensor"], observed=True)["weight"].sum().unstack(fill_value=0)
+    annual_by_sensor = (
+        sub.groupby(["year", "sensor"], observed=True)["weight"]
+        .sum().unstack(fill_value=0).reindex(years, fill_value=0)
+    )
     annual_total = annual_by_sensor.sum(axis=1)
-    annual_raw = sub.groupby("year").size()
+    annual_raw = sub.groupby("year").size().reindex(years, fill_value=0)
     full_years = [y for y in years if full.loc[y].all()]
     trend_h = rel_trend(annual_total, full_years)
     trend_raw = rel_trend(annual_raw, full_years)
@@ -1975,27 +2132,27 @@ if sub is not None:
     if len(hist) > 0:
         status = status_for(current, hist)
 
-    modis_share = (
-        (annual_by_sensor["MODIS"] / annual_total)
-        if "MODIS" in annual_by_sensor
-        else pd.Series(0.0, index=annual_total.index)
+    # Annual stripes & year verdicts always reflect the whole archive (still
+    # AOI- and filter-scoped) so short date windows don't collapse them.
+    arch_stats = archive_year_stats(
+        str(path), path.stat().st_mtime,
+        aoi_poly.wkt if aoi_poly is not None else None,
+        drop_low, veg_only,
+        "snpp" if viirs_mode.startswith("SNPP") else "all",
+        scaling.startswith("By"), int(min_monthly),
     )
-    ytd = None
-    past_full = [y for y in full_years if y < ly]
-    if ly not in full_years and len(past_full) >= 4:
-        upto = (sub["month"] < lm) | ((sub["month"] == lm) & (sub["acq_date"].dt.day <= last_day))
-        ytd_by_year = sub[upto].groupby("year")["weight"].sum()
-        ytd = dict(
-            year=ly,
-            cur=float(ytd_by_year.get(ly, 0.0)),
-            hist=ytd_by_year.reindex(past_full, fill_value=0.0),
-            label=f"{calendar.month_abbr[lm]} {last_day}",
-        )
-    verdicts = year_verdicts(annual_total, modis_share, pivot_cov, full_years, med_by_month, ytd)
+    verdicts, year_baseline = arch_stats if arch_stats is not None else ([], None)
     vmap = {v["year"]: v for v in verdicts}
-    year_baseline = float(annual_total.loc[full_years].median()) if len(full_years) >= 4 else None
+    alert_days = archive_alert_days(
+        str(path), path.stat().st_mtime,
+        aoi_poly.wkt if aoi_poly is not None else None,
+        drop_low, veg_only,
+        "snpp" if viirs_mode.startswith("SNPP") else "all",
+        scaling.startswith("By"), int(min_monthly),
+    )
     region_text = match_title + (" (selected area)" if aoi_poly is not None else "")
-    field_notes = derive_field_notes(sub, med_by_month, info, verdicts, region_text)
+    has_frp = bool(info["flags"].get("has_frp"))
+    field_notes = derive_field_notes(sub, med_by_month, info, verdicts, region_text, veg_only)
 
 draw_mode = bool(match) and aoi_mode == "Draw on map"
 aoi_key = hashlib.md5(aoi_poly.wkt.encode()).hexdigest()[:8] if aoi_poly is not None else "none"
@@ -2011,41 +2168,47 @@ HERO_LINES = {
 def render_map(msub, tag="all", height=640):
     m = base_map(style)
 
-    # Landing map: light up countries with loaded FIRMS archives
-    if match is None:
-        loaded_keys = [k for k in regions if has_data(k) and k in geoms_wkb and k not in ALIASES]
-        if loaded_keys:
-            feats = []
-            for k in loaded_keys:
-                g = shapely.from_wkb(geoms_wkb[k])
-                feats.append({
-                    "type": "Feature",
-                    "properties": {"region": k.title(), "key": k},
-                    "geometry": mapping(g),
-                })
-            folium.GeoJson(
-                {"type": "FeatureCollection", "features": feats},
-                style_function=lambda f: {
-                    "fillColor": "#f06428",
-                    "fillOpacity": 0.28,
-                    "color": "#f06428",
-                    "weight": 1.6,
-                },
-                highlight_function=lambda f: {
-                    "fillColor": "#f06428",
-                    "fillOpacity": 0.50,
-                    "color": "#f4f0e6",
-                    "weight": 2.2,
-                },
-                tooltip=folium.GeoJsonTooltip(fields=["region"], aliases=["Click to open"]),
-            ).add_to(m)
+    # Clickable country overlay (loaded archives) — mounted under the detection
+    # layers on every map so another country can be opened with one click,
+    # even after zooming into a region.
+    loaded_keys = [k for k in regions if has_data(k) and k in geoms_wkb and k not in ALIASES]
+    if loaded_keys:
+        feats = []
+        for k in loaded_keys:
+            g = shapely.from_wkb(geoms_wkb[k])
+            feats.append({
+                "type": "Feature",
+                "properties": {"region": k.title(), "key": k, "status": "Ready ● · click to open"},
+                "geometry": mapping(g),
+            })
+        folium.GeoJson(
+            {"type": "FeatureCollection", "features": feats},
+            style_function=lambda f: {
+                "fillColor": "#f06428",
+                "fillOpacity": 0.16 if match is not None else 0.28,
+                "color": "#f06428",
+                "weight": 1.2 if match is not None else 1.6,
+            },
+            highlight_function=lambda f: {
+                "fillColor": "#f06428",
+                "fillOpacity": 0.45,
+                "color": "#f4f0e6",
+                "weight": 2.2,
+            },
+            tooltip=folium.GeoJsonTooltip(
+                fields=["region", "status"],
+                aliases=["Country", "Status"],
+                sticky=True,
+            ),
+        ).add_to(m)
 
     if msub is not None:
         if layer == "Points":
             n_all, n_shown = add_points(m, msub, color_by="sensor")
             if n_shown < n_all:
                 st.caption(
-                    f"Showing {n_shown:,} of {n_all:,} detections, sampled evenly per sensor. "
+                    f"Showing {n_shown:,} of {n_all:,} detections from the harmonized record "
+                    "(post-2012 MODIS rows are spliced out), sampled evenly per sensor. "
                     "Switch to Density grid to see full counts."
                 )
         elif layer == "Day vs night (solar)":
@@ -2116,27 +2279,45 @@ def render_map(msub, tag="all", height=640):
     ret_objs = []
     if draw_mode and data_ready:
         ret_objs = ["all_drawings"]
-    elif match is None:
-        ret_objs = ["last_clicked"]
+    else:
+        # Country picks come only from clicks on the highlighted country layer.
+        # last_object_clicked is the click's fresh lat/lng (last_clicked goes
+        # stale because feature clicks don't always fire the map handler), and
+        # the tooltip/count identify which layer was hit and dedupe repeats.
+        ret_objs = ["last_object_clicked", "last_object_clicked_tooltip",
+                    "last_object_clicked_count"]
 
+    map_key = f"map-{match}-{layer}-{style}-{aoi_key}-{tag}-{st.session_state.get('_map_epoch', 0)}"
     result = st_folium(
         m,
         height=height,
         use_container_width=True,
         returned_objects=ret_objs,
-        key=f"map-{match}-{layer}-{style}-{aoi_key}-{tag}",
+        key=map_key,
     )
 
-    if match is None and result and result.get("last_clicked"):
-        clk = (round(result["last_clicked"]["lat"], 4), round(result["last_clicked"]["lng"], 4))
-        if clk != st.session_state.get("_land_click"):
-            st.session_state["_land_click"] = clk
-            pt = Point(clk[1], clk[0])
-            candidates = [k for k in regions if has_data(k) and k in geoms_wkb and k not in ALIASES]
-            candidates += [k for k in geoms_wkb if k not in candidates and k not in ALIASES]
-            for k in candidates:
-                if shapely.from_wkb(geoms_wkb[k]).contains(pt):
-                    st.session_state["region_pick"] = k
+    if result and not (draw_mode and data_ready):
+        tip = str(result.get("last_object_clicked_tooltip") or "")
+        loc = result.get("last_object_clicked")
+        cnt = result.get("last_object_clicked_count")
+        # Only our country features carry "click to open" in their tooltip —
+        # fire points, density cells and AOI borders are ignored.
+        if loc and cnt is not None and "click to open" in tip.lower():
+            sig = (map_key, cnt)
+            if sig != st.session_state.get("_land_obj"):
+                st.session_state["_land_obj"] = sig
+                pt = Point(float(loc["lng"]), float(loc["lat"]))
+                hits = []
+                for k in [k for k in regions if k in geoms_wkb and k not in ALIASES]:
+                    g = shapely.from_wkb(geoms_wkb[k])
+                    if g.covers(pt):
+                        hits.append((g.area, k))
+                if hits:
+                    # Prefer countries with a loaded archive; break ties by
+                    # smallest polygon for overlapping boundaries.
+                    with_data = [h for h in hits if has_data(h[1])]
+                    pool = with_data or hits
+                    st.session_state["_pending_region"] = min(pool)[1]
                     st.rerun()
 
     if draw_mode and data_ready and result and result.get("all_drawings"):
@@ -2161,6 +2342,184 @@ def render_field_notes(notes):
             f"</div>"
         )
     st.markdown(f'<div class="notes-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
+SRC_CLASSES = [
+    "Vegetation / agricultural (unresolved)",
+    "Industrial / static source",
+    "Non-vegetation (FIRMS type)",
+]
+SRC_COLORS = {
+    "Vegetation / agricultural (unresolved)": "#f06428",
+    "Industrial / static source": "#7a8ba8",
+    "Non-vegetation (FIRMS type)": "#5b564f",
+}
+
+
+def source_class_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate detections into fire-source classes at ~1 km cell level.
+
+    Deliberately conservative: only persistent year-round recurring cells
+    (gas flares, industrial stacks) are split out as 'Industrial / static'.
+    Everything else stays 'Vegetation / agricultural (unresolved)' because
+    FIRMS alone cannot separate field burning from wildfire without a
+    land-cover join. Computed per cell so it stays cheap on reruns.
+    """
+    if "firms_type" not in df:
+        df = df.assign(firms_type=np.nan)
+    key = df["latitude"].round(2).astype(str) + "|" + df["longitude"].round(2).astype(str)
+    cell = df.groupby(key, sort=False).agg(
+        days=("acq_date", "nunique"),
+        months=("month", "nunique"),
+        years=("year", "nunique"),
+        n=("weight", "size"),
+        w=("weight", "sum"),
+        ft=("firms_type", "first"),
+    )
+
+    span_days = max((df["acq_date"].max() - df["acq_date"].min()).days, 1)
+
+    cls = pd.Series("Vegetation / agricultural (unresolved)", index=cell.index, dtype=object)
+    ft = cell["ft"]
+    for code, name in ((1.0, "Volcano (FIRMS type 1)"), (2.0, "Industrial / static (FIRMS type 2)"),
+                       (3.0, "Offshore (FIRMS type 3)")):
+        cls[ft == code] = name
+    # Fires on most days across many months and years => fixed industrial/flaring source
+    persistent = ((cell["days"] >= 15) & (cell["months"] >= 8) & (cell["years"] >= 3)
+                  & (cell["days"] >= 0.15 * span_days))
+    cls[persistent & (cls == "Vegetation / agricultural (unresolved)")] = "Industrial / static source"
+    cell["cls"] = cls
+
+    return (cell.groupby("cls")
+            .agg(detections=("n", "sum"), viirs_eq=("w", "sum"))
+            .reset_index())
+
+
+def render_predict(sub, style, match, bbox, aoi_poly, region_text):
+    st.markdown(
+        f'<p class="lede">Two tools that look at recent and unusual activity: a conservative '
+        f"<b>fire-source classifier</b> that flags persistent industrial/static heat sources so "
+        f"they are not mistaken for landscape fire, and a <b>recent-activity footprint</b> that "
+        f"buffers the latest ignition clusters outward. Both are approximations — read the caveats.</p>",
+        unsafe_allow_html=True,
+    )
+
+    # ---- Source classification ----
+    st.markdown('<div class="sb-label">Fire source classification</div>', unsafe_allow_html=True)
+    c1, c2, c3 = st.columns([2, 1, 1])
+    c1.caption(
+        "Classified per ~1 km cell across the whole selected period. Only cells that recur "
+        "year-round on many separate days are flagged as industrial/static sources; everything "
+        "else stays 'Vegetation / agricultural (unresolved)' — FIRMS cannot separate field "
+        "burning from wildfire without land-cover data. FIRMS type 1–3 detections are labelled "
+        "directly when the vegetation-only filter is off."
+    )
+    show_classes = c2.checkbox("Classify sources", True, key="src_class_on")
+    if show_classes:
+        summ = source_class_summary(sub)
+        counts = summ.set_index("cls")["viirs_eq"]
+        det_counts = summ.set_index("cls")["detections"]
+    else:
+        counts = pd.Series({"Vegetation / agricultural (unresolved)": float(sub["weight"].sum())}, dtype=float)
+        det_counts = pd.Series({"Vegetation / agricultural (unresolved)": float(len(sub))}, dtype=float)
+
+    order = [c for c in SRC_CLASSES if c in counts.index] + [
+        c for c in counts.index if c not in SRC_CLASSES]
+    if len(counts):
+        chart_df = pd.DataFrame({
+            "cls": order,
+            "viirs_eq": counts.reindex(order).fillna(0).to_numpy(),
+            "detections": det_counts.reindex(order).fillna(0).round(0).astype(int).to_numpy(),
+        })
+        fig = px.bar(
+            chart_df, x="viirs_eq", y="cls", orientation="h",
+            labels=dict(viirs_eq="VIIRS-equivalent detections", cls="", detections="Raw detections"),
+            color="cls",
+            color_discrete_map={c: SRC_COLORS.get(c, "#8a857c") for c in order},
+            hover_data={"detections": True, "viirs_eq": ":.0f"},
+        )
+        fig.update_layout(height=max(220, 34 * len(order)), showlegend=False, margin=dict(l=8, r=8, t=8, b=8))
+        show(tidy(fig, "", 240), "srctypes")
+
+    # ---- Recent activity footprint ----
+    st.markdown('<div class="sb-label">Recent activity footprint (heuristic)</div>', unsafe_allow_html=True)
+    p1, p2, p3 = st.columns(3)
+    window = p1.select_slider("Recent window (days)", options=[7, 14, 30, 60, 120], value=30,
+                              key="spread_window", format_func=lambda d: f"{d} d")
+    rate = p2.select_slider("Spread rate (km/day)", options=[0.5, 1, 2, 3, 5], value=2,
+                            key="spread_rate", format_func=lambda r: f"{r:g} km/d")
+    horizon = p3.select_slider("Project ahead (days)", options=[1, 3, 7, 14], value=7,
+                               key="spread_horizon", format_func=lambda d: f"{d} d")
+
+    cutoff = sub["acq_date"].max() - pd.Timedelta(days=window)
+    src = sub[sub["acq_date"] >= cutoff]
+    st.caption(
+        f"Using {fmt(len(src))} detections ending {sub['acq_date'].max():%d %b %Y} "
+        f"(the 'recent' window is relative to the end of your selected period). Circles buffer "
+        f"each active cluster by {rate * horizon:g} km at {rate:g} km/day — an upper-bound "
+        f"envelope, not a prediction. No wind, terrain, fuel, or still-burning assumption."
+    )
+    if src.empty:
+        st.info("No detections in that recent window — widen it or pick another period.")
+        return
+
+    cell = 0.1
+    cl = src.assign(
+        glat=(src["latitude"] / cell).round() * cell,
+        glon=(src["longitude"] / cell).round() * cell,
+    ).groupby(["glat", "glon"], as_index=False).agg(
+        n=("weight", "size"), w=("weight", "sum"),
+        la=("latitude", "mean"), lo=("longitude", "mean"),
+    ).sort_values("w", ascending=False).head(30)
+
+    m = base_map(style if style in ("Dark", "Light", "Satellite") else "Dark")
+    max_w = float(cl["w"].max()) if len(cl) else 1.0
+    for _, r in cl.iterrows():
+        intensity = r["w"] / max_w
+        col = "#f06428" if intensity > 0.66 else ("#e8a13c" if intensity > 0.33 else "#c96f2e")
+        folium.Circle(
+            location=[r["la"], r["lo"]],
+            radius=rate * horizon * 1000,
+            color=col, weight=1.5, opacity=0.85,
+            fill=True, fill_color=col, fill_opacity=0.10 + 0.18 * intensity,
+            popup=(f"{int(r['n']):,} detections in window<br>"
+                   f"Projected reach: {rate * horizon:g} km"),
+        ).add_to(m)
+        folium.CircleMarker(
+            location=[r["la"], r["lo"]], radius=4, color="#f4f0e6", weight=1,
+            fill=True, fill_color=col, fill_opacity=0.95,
+            tooltip=f"{int(r['n']):,} recent detections",
+        ).add_to(m)
+
+    legend_html = (
+        f'<div style="{MAP_LEGEND_STYLE}">'
+        "<b>Recent activity footprint</b><br>"
+        '<span style="color:#f06428">●</span> high-activity cluster &nbsp;'
+        '<span style="color:#e8a13c">●</span> medium &nbsp;'
+        '<span style="color:#c96f2e">●</span> lower<br>'
+        f"circles = {rate * horizon:g} km reach at {rate:g} km/day over {horizon} d"
+        "</div>"
+    )
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+    if aoi_poly is not None:
+        folium.GeoJson(
+            mapping(aoi_poly),
+            style_function=lambda f: {"color": AOI_COLOR, "weight": 2, "dashArray": "6 4",
+                                      "fillColor": AOI_COLOR, "fillOpacity": 0.05},
+        ).add_to(m)
+    elif bbox:
+        m.fit_bounds([[bbox[0], bbox[2]], [bbox[1], bbox[3]]])
+    else:
+        m.fit_bounds([[cl["la"].min() - 0.5, cl["lo"].min() - 0.5],
+                      [cl["la"].max() + 0.5, cl["lo"].max() + 0.5]])
+    st_folium(m, height=560, use_container_width=True, returned_objects=[],
+              key=f"spread-{match}-{window}-{rate}-{horizon}-{aoi_key}")
+
+    st.caption(
+        f"Top {len(cl)} ignition clusters from {fmt(len(src))} recent detections. "
+        "Treat the circles as an upper-bound envelope, not a prediction of perimeter."
+    )
 
 
 def render_overview():
@@ -2237,6 +2596,22 @@ def render_overview():
             e.metric("Annual trend", "n/a", help="Needs at least five complete years in the selected range.")
         g.metric("Latest data", f"{dmax:%d %b %Y}")
 
+        if has_frp and sub["frp_w"].sum() > 0:
+            fr1, fr2 = st.columns(2)
+            fr1.metric(
+                "Total FRP",
+                f"{sub['frp_w'].sum():,.0f} MW",
+                help="Sum of per-detection fire radiative power (MW) across the period, "
+                "averaged over the active satellite constellation. An intensity proxy, "
+                "not a burned-area measurement.",
+            )
+            fr2.metric(
+                "Peak detection",
+                f"{sub['frp_w'].max():,.0f} MW",
+                help="Largest single-detection FRP in the period — often a major fire front "
+                "or an industrial heat source.",
+            )
+
         if med_by_month.notna().any() and med_by_month.max() > 0:
             top = float(med_by_month.max())
             cells = []
@@ -2288,12 +2663,12 @@ def render_overview():
             key=f"map_year_{match}_{years_all[0]}_{years_all[-1]}_{aoi_key}",
         )
         month_opts = list(range(1, 13))
+        st.session_state.setdefault("map_months", month_opts)
         if hasattr(st, "pills"):
             month_pick = st.pills(
                 "Months on the map",
                 month_opts,
                 selection_mode="multi",
-                default=month_opts,
                 format_func=lambda mo: calendar.month_abbr[mo],
                 key="map_months",
             )
@@ -2301,7 +2676,6 @@ def render_overview():
             month_pick = st.multiselect(
                 "Months on the map",
                 month_opts,
-                default=month_opts,
                 format_func=lambda mo: calendar.month_abbr[mo],
                 key="map_months",
             )
@@ -2321,17 +2695,46 @@ def render_overview():
                 st.caption(f"{fmt(len(msub))} detections in this map window.")
             render_map(msub, tag)
 
+    if alert_days is not None and len(alert_days):
+        with st.expander(f"Unusual activity days — top {len(alert_days)} across the archive", expanded=False):
+            st.dataframe(alert_days, hide_index=True)
+            st.caption(
+                "Days where detections ran at least 2× (and 10+ detections) the median of the "
+                "same day-of-year across other complete years. Computed over the whole record "
+                "for the current area and filters, so it stays meaningful for short date ranges. "
+                "A spike can mean a real outbreak, a sensor artefact, or persistent industrial heat."
+            )
+
 
 # Main workspace
 if sub is not None:
-    t_over, t_year, t_cal, t_trend, t_time, t_harm, t_data = st.tabs(
-        ["Overview", "Year by year", "Calendar & clock", "Trends & pacing", "Timelapse", "Harmonization", "Data"]
-    )
+    # Section nav: only the active section's body executes on each rerun,
+    # which keeps the heavy tabs (timelapse, predict) from slowing every click.
+    _nav_labels = ["Overview", "Year by year", "Calendar & clock", "Trends & pacing",
+                   "Timelapse", "Predict & sources", "Harmonization", "Data"]
+    _nav_keys = ["overview", "year", "cal", "trend", "time", "pred", "harm", "data"]
+    _qp = st.query_params.get("tab", "overview")
+    _nav_i = _nav_keys.index(_qp) if _qp in _nav_keys else 0
+    st.session_state.setdefault("section_nav", _nav_labels[_nav_i])
+    if hasattr(st, "pills"):
+        _sel = st.pills("Section", _nav_labels, selection_mode="single",
+                        key="section_nav", label_visibility="collapsed")
+        if isinstance(_sel, (list, tuple)):
+            _sel = _sel[0] if _sel else _nav_labels[_nav_i]
+    else:
+        _sel = st.radio("Section", _nav_labels,
+                        index=_nav_labels.index(st.session_state["section_nav"])
+                        if st.session_state["section_nav"] in _nav_labels else _nav_i,
+                        horizontal=True, label_visibility="collapsed", key="section_nav")
+    _sel = _sel if _sel in _nav_labels else "Overview"
+    _tab_key = _nav_keys[_nav_labels.index(_sel)]
+    if st.query_params.get("tab") != _tab_key:
+        st.query_params["tab"] = _tab_key
 
-    with t_over:
+    if _sel == "Overview":
         render_overview()
 
-    with t_year:
+    elif _sel == "Year by year":
         st.markdown(
             f'<p class="lede">{escape(years_summary(verdicts, region_text, year_baseline))}</p>',
             unsafe_allow_html=True,
@@ -2421,7 +2824,7 @@ if sub is not None:
             "Hover any card for the full breakdown."
         )
 
-    with t_cal:
+    elif _sel == "Calendar & clock":
         ca, cb = st.columns([2, 1])
         mode_c = ca.radio("Show", ["Detections", "Anomaly vs median"], horizontal=True, key="calmode")
         ramp = cb.selectbox(
@@ -2577,7 +2980,14 @@ if sub is not None:
             )
             show(tidy(sc, "Seasonal cycle against the latest year", 340), "season")
 
-    with t_trend:
+    elif _sel == "Trends & pacing":
+        cmp_mode = st.selectbox(
+            "Benchmark this period against",
+            ["Nothing", "Same dates, previous year", "Median year, same months"],
+            key=f"cmp_{match}_{aoi_key}",
+            help="Adds a comparison baseline to the annual and monthly views below.",
+        )
+
         ann = go.Figure()
         ci = info["factor_ci"]
         for s, nm in (("MODIS", "MODIS-derived"), ("VIIRS", "VIIRS"), ("UNKNOWN", "Unlabelled")):
@@ -2615,6 +3025,89 @@ if sub is not None:
         if ci and not scaling.startswith("By"):
             st.caption("Whiskers on the MODIS-derived bars show the bootstrap range of the scaling factor.")
 
+        if cmp_mode == "Same dates, previous year":
+            d0p = (pd.Timestamp(d0) - pd.DateOffset(years=1)).date()
+            d1p = (pd.Timestamp(d1) - pd.DateOffset(years=1)).date()
+            comp = hot[(hot["acq_date"] >= pd.Timestamp(d0p)) & (hot["acq_date"] <= pd.Timestamp(d1p))]
+            if aoi_poly is not None:
+                comp = apply_aoi(comp, aoi_poly)
+            if comp.empty:
+                st.info("No detections in the same dates of the previous year for this area.")
+            else:
+                w_sub, w_cmp = float(sub["weight"].sum()), float(comp["weight"].sum())
+                pct = (w_sub - w_cmp) / w_cmp * 100 if w_cmp > 0 else np.nan
+                m1, m2 = st.columns(2)
+                m1.metric(
+                    "Selected period",
+                    f"{fmt(w_sub)}",
+                    help="VIIRS-equivalent detections in the selected window.",
+                )
+                m2.metric(
+                    "Previous year, same dates",
+                    f"{fmt(w_cmp)}",
+                    delta=(f"{pct:+.0f}%" if np.isfinite(pct) else None),
+                    delta_color="inverse",
+                    help="Same calendar dates one year earlier, same area and filters.",
+                )
+                mon = pd.DataFrame({
+                    "month": range(1, 13),
+                    "Selected": [float(sub.loc[sub["month"] == mo, "weight"].sum()) for mo in range(1, 13)],
+                    "Previous year": [float(comp.loc[comp["month"] == mo, "weight"].sum()) for mo in range(1, 13)],
+                })
+                cfig = go.Figure()
+                for col, nm, clr in (("Selected", "Selected period", VIIRS_COLOR), ("Previous year", "Previous year", "rgba(203,197,185,0.75)")):
+                    cfig.add_bar(x=[calendar.month_abbr[m] for m in mon["month"]], y=mon[col], name=nm, marker_color=clr)
+                cfig.update_layout(barmode="group")
+                show(tidy(cfig, "Monthly detections: selected period vs same dates last year", 320), "cmp_year")
+                st.caption(
+                    "Both windows use the same area and filters. Months outside the selected "
+                    "range are simply absent from the selected series."
+                )
+        elif cmp_mode == "Median year, same months":
+            months_in = sorted(int(m) for m in pivot_cov.columns[pivot_cov.notna().any()])
+            sub_mon = sub.groupby("month")["weight"].sum()
+            med = med_by_month.reindex(months_in)
+            cfig = go.Figure()
+            cfig.add_bar(
+                x=[calendar.month_abbr[m] for m in months_in],
+                y=[float(sub_mon.get(m, 0.0)) for m in months_in],
+                name="Selected period",
+                marker_color=VIIRS_COLOR,
+            )
+            cfig.add_scatter(
+                x=[calendar.month_abbr[m] for m in months_in],
+                y=med.to_numpy(float),
+                mode="lines+markers",
+                name="Median of complete years",
+                line=dict(color=SAGE_COLOR, width=2, dash="dash"),
+            )
+            show(tidy(cfig, "Selected period vs a median year, by calendar month", 320), "cmp_med")
+            st.caption(
+                "The dashed line is the median of the complete years inside the selected range "
+                "for each calendar month — a 'typical year' benchmark, not a single past year."
+            )
+
+        if has_frp and sub["frp_w"].sum() > 0:
+            fr = sub.groupby("year")["frp_w"].sum()
+            ffig = go.Figure(
+                go.Scatter(
+                    x=fr.index,
+                    y=fr.to_numpy(),
+                    mode="lines+markers",
+                    line=dict(color="#f06428", width=2),
+                    fill="tozeroy",
+                    fillcolor="rgba(240,100,40,0.14)",
+                    name="FRP",
+                )
+            )
+            show(tidy(ffig, "Annual fire radiative power (FRP)", 300), "frp_year")
+            st.caption(
+                "FRP is satellite-measured fire intensity in megawatts, summed per year and "
+                "averaged across the active constellation. It is an intensity proxy — not a "
+                "burned-area measurement — and can be dominated by a few large fires or "
+                "persistent industrial heat sources."
+            )
+
         # Cumulative year-over-year burn pacing
         if len(full_years) >= 3:
             doy_df = sub.assign(doy=sub["acq_date"].dt.dayofyear.clip(upper=365))
@@ -2622,7 +3115,7 @@ if sub is not None:
                 doy_df.groupby(["year", "doy"])["weight"]
                 .sum()
                 .unstack("doy")
-                .reindex(columns=range(1, 366), fill_value=0.0)
+                .reindex(index=years, columns=range(1, 366), fill_value=0.0)
                 .cumsum(axis=1)
             )
             month_starts = [pd.Timestamp(2021, m, 1).dayofyear for m in range(1, 13)]
@@ -2715,7 +3208,7 @@ if sub is not None:
             bar.update_xaxes(dtick=2)
             show(tidy(bar, f"{calendar.month_name[lm]}, days 1–{last_day}, every year"), "monthcmp")
 
-    with t_time:
+    elif _sel == "Timelapse":
         try:
             if aoi_poly is not None:
                 bx0, by0, bx1, by1 = aoi_poly.bounds
@@ -2786,7 +3279,10 @@ if sub is not None:
         except Exception as exc:
             st.info(f"The timelapse could not be drawn here ({exc}). Update plotly to 5.24 or newer and try again.")
 
-    with t_harm:
+    elif _sel == "Predict & sources":
+        render_predict(sub, style, match, bbox, aoi_poly, region_text)
+
+    elif _sel == "Harmonization":
         if not info["has_both"]:
             st.info(
                 "This file has one sensor only, so no MODIS/VIIRS harmonization is needed. "
@@ -2930,6 +3426,38 @@ if sub is not None:
                     "changes. That is why the app normalizes per satellite and defaults to SNPP only."
                 )
 
+            cont = (
+                info["raw_monthly"]
+                .groupby(["ym", "sensor"], observed=True)["n"]
+                .sum()
+                .unstack(fill_value=0)
+                .sort_index()
+            )
+            if len(cont):
+                seam = go.Figure()
+                for s, nm, clr in (
+                    ("MODIS", "MODIS (raw)", MODIS_COLOR),
+                    ("VIIRS", "VIIRS (raw)", VIIRS_COLOR),
+                    ("UNKNOWN", "Unlabelled (raw)", OTHER_COLOR),
+                ):
+                    if s in cont.columns and cont[s].sum() > 0:
+                        seam.add_scatter(
+                            x=cont.index, y=cont[s].to_numpy(), mode="lines",
+                            name=nm, line=dict(color=clr, width=1.8),
+                        )
+                if info["split"] is not None:
+                    seam.add_vline(x=info["split"], line_dash="dash", line_color="#f4f0e6")
+                seam.update_xaxes(title="Month")
+                seam.update_yaxes(title="Raw detections / month")
+                show(tidy(seam, "Sensor continuity: raw monthly detections across the whole record", 340), "seam")
+                st.caption(
+                    "Raw counts before harmonization, for the whole file. The dashed line marks "
+                    f"{info['split']:%B %Y}, when VIIRS becomes the primary record and scaled MODIS "
+                    "is spliced out. Steps in either line are constellation changes (satellites "
+                    "joining), not changes in fire activity — which is why the harmonized series "
+                    "normalizes per satellite."
+                )
+
             if scaling.startswith("By"):
                 tbl = pd.DataFrame({
                     "Month": [calendar.month_abbr[mo] for mo in range(1, 13)],
@@ -2938,11 +3466,13 @@ if sub is not None:
                 with st.expander("Monthly scaling factors"):
                     st.dataframe(tbl, hide_index=True)
 
-    with t_data:
-        key = (match, str(d0), str(d1), drop_low, veg_only, viirs_mode, scaling, int(min_monthly), aoi_key)
+    else:
+        key = (match, str(d0), str(d1), drop_low, veg_only, viirs_mode, scaling, int(min_monthly),
+               round(path.stat().st_mtime, 1), aoi_key)
         mt = (
             sub.groupby(["year", "month"])
-            .agg(detections_viirs_equiv=("weight", "sum"), raw_detections=("weight", "size"))
+            .agg(detections_viirs_equiv=("weight", "sum"), raw_detections=("weight", "size"),
+                 frp_mw=("frp_w", "sum"))
             .reset_index()
         )
         mt["median_same_month"] = mt["month"].map(med_by_month)
@@ -2952,7 +3482,13 @@ if sub is not None:
             (mt["detections_viirs_equiv"] - mt["median_same_month"]) / mt["median_same_month"] * 100,
             np.nan,
         )
-        mt = mt.round({"detections_viirs_equiv": 1, "median_same_month": 1, "anomaly_pct": 1})
+        mt = mt.round({"detections_viirs_equiv": 1, "median_same_month": 1, "anomaly_pct": 1, "frp_mw": 0})
+        flat = (
+            pivot_full.rename_axis("year")
+            .reset_index()
+            .melt(id_vars="year", var_name="month", value_name="n")
+            .dropna()
+        )
 
         report = [
             f"# Fire activity summary: {region_text}",
@@ -2960,6 +3496,8 @@ if sub is not None:
             f"- Period: {d0} to {d1} (data through {dmax})",
             f"- Area: {'whole region bounding data' if aoi_poly is None else f'custom area, about {aoi_area:,.0f} km2'}",
             f"- Detections kept: {len(sub):,} (VIIRS-equivalent total {sub['weight'].sum():,.0f})",
+            *([f"- Total FRP: {sub['frp_w'].sum():,.0f} MW (summed per-detection fire radiative power; intensity proxy, not burned area)"]
+              if has_frp and sub["frp_w"].sum() > 0 else []),
             f"- Filters: low confidence {'dropped' if drop_low else 'kept'}, "
             f"{'vegetation fires only' if veg_only else 'all fire types'}, "
             f"VIIRS {'SNPP only' if viirs_mode.startswith('SNPP') else 'all satellites, normalized'}",
@@ -3002,7 +3540,7 @@ if sub is not None:
             to_csv(key, sub),
             file_name=f"{stem}_hotspots.csv",
             mime="text/csv",
-            help="Every detection in the current area and period, with sensor, satellite and VIIRS-equivalent weight.",
+            help="The harmonized (spliced) record for the current area and period — post-2012 MODIS rows are omitted when the VIIRS-only rule applies. Includes sensor, satellite and VIIRS-equivalent weight.",
         )
         d2c.download_button(
             "Monthly series with anomalies (CSV)",
@@ -3030,23 +3568,13 @@ else:
     if match is None:
         loaded_keys = sorted(k for k in regions if has_data(k) and k not in ALIASES)
         if loaded_keys:
-            lc1, lc2 = st.columns([4, 1], gap="medium")
-            lc1.markdown(
+            st.markdown(
                 '<div class="landing-caption">'
-                "<span>Click any highlighted country on the map or jump directly into a loaded archive below. "
+                "<span>Click any highlighted country on the map to open its archive. "
                 "Inside any region, draw a polygon or enter coordinates to inspect a park, province, or watershed.</span>"
                 "</div>",
                 unsafe_allow_html=True,
             )
-            if len(loaded_keys) > 1 and lc2.button("Random region", key="rand_region", use_container_width=True):
-                st.session_state["region_pick"] = random.choice(loaded_keys)
-                st.rerun()
-
-            btn_cols = st.columns(min(len(loaded_keys), 6))
-            for idx, rk in enumerate(loaded_keys):
-                if btn_cols[idx % len(btn_cols)].button(rk.title(), key=f"quick_{rk}", use_container_width=True):
-                    st.session_state["region_pick"] = rk
-                    st.rerun()
         else:
             st.markdown(
                 '<p class="note" style="margin-top:.85rem">Search for any country in the sidebar, and place '
