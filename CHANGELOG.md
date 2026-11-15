@@ -107,4 +107,4 @@ Rating threshold. It is now four complete years everywhere, in one constant.
 Tab name. “Predict & sources” is now “Recent activity & sources”.
 A bug in the alert-days table. Every date showed 2021. It now shows the real year, for example “05 Apr 2010”.
 
-# @queriesonhold@gmail.com for more info.
+@queriesonhold@gmail.com for more info.
