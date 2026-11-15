@@ -99,6 +99,8 @@ ALIASES = {
     "drc": "dem. rep. congo",
     "congo republic": "congo",
     "czech republic": "czechia",
+    "russian federation": "russia",
+    "falkland islands": "falkland is.",
 }
 
 # Microstates left out of 110m Natural Earth polygons
@@ -161,23 +163,47 @@ VIIRS_PLATFORMS = {"SNPP", "NOAA-20", "NOAA-21"}
 
 
 def normalize_platform(sat: pd.Series) -> pd.Series:
+    # Category-level mapping: avoids materializing millions of Python strings
+    # on huge country files (Russia ~25M rows).
+    if isinstance(sat.dtype, pd.CategoricalDtype):
+        sat_cats = list(sat.cat.categories)
+        plat_per_cat = [
+            PLATFORM_MAP.get(str(c).strip().upper(), "UNKNOWN") for c in sat_cats
+        ]
+        plat_cats = sorted(set(plat_per_cat))
+        lookup = np.array([plat_cats.index(p) for p in plat_per_cat], dtype=np.int16)
+        codes = sat.cat.codes.to_numpy()
+        new_codes = np.where(codes >= 0, lookup[np.clip(codes, 0, None)], -1).astype(np.int16)
+        return pd.Series(
+            pd.Categorical.from_codes(new_codes, categories=plat_cats),
+            index=sat.index,
+        )
     s = sat.astype(str).str.strip().str.upper()
     return s.map(PLATFORM_MAP).fillna("UNKNOWN")
 
 
 def infer_sensor(df: pd.DataFrame, platform: pd.Series) -> pd.Series:
-    sensor = pd.Series("UNKNOWN", index=df.index, dtype=object)
+    # Integer codes -> Categorical: avoids a 25M-row object-dtype string column.
+    codes = np.full(len(df), 2, dtype=np.int8)  # 0=MODIS 1=VIIRS 2=UNKNOWN
     if "brightness" in df:
-        sensor[df["brightness"].notna()] = "MODIS"
+        codes[df["brightness"].notna().to_numpy()] = 0
     if "bright_ti4" in df:
-        sensor[df["bright_ti4"].notna()] = "VIIRS"
-    sensor[platform.isin(MODIS_PLATFORMS)] = "MODIS"
-    sensor[platform.isin(VIIRS_PLATFORMS)] = "VIIRS"
+        codes[df["bright_ti4"].notna().to_numpy()] = 1
+    codes[platform.isin(MODIS_PLATFORMS).to_numpy()] = 0
+    codes[platform.isin(VIIRS_PLATFORMS).to_numpy()] = 1
     if "instrument" in df:
-        ins = df["instrument"].astype(str).str.upper()
-        sensor[ins.str.contains("MODIS", na=False)] = "MODIS"
-        sensor[ins.str.contains("VIIRS", na=False)] = "VIIRS"
-    return sensor
+        ins = df["instrument"]
+        if isinstance(ins.dtype, pd.CategoricalDtype):
+            cats = ins.cat.categories.astype(str).str.upper()
+            modis_cats = set(cats[cats.str.contains("MODIS", na=False)])
+            viirs_cats = set(cats[cats.str.contains("VIIRS", na=False)])
+            codes[ins.isin(modis_cats).to_numpy()] = 0
+            codes[ins.isin(viirs_cats).to_numpy()] = 1
+        else:
+            ins_up = ins.astype(str).str.upper()
+            codes[ins_up.str.contains("MODIS", na=False).to_numpy()] = 0
+            codes[ins_up.str.contains("VIIRS", na=False).to_numpy()] = 1
+    return pd.Categorical.from_codes(codes, categories=["MODIS", "VIIRS", "UNKNOWN"])
 
 
 @st.cache_resource
@@ -198,7 +224,8 @@ def read_file(path_str: str, mtime: float):
     df["acq_date"] = pd.to_datetime(df["acq_date"]).dt.normalize()
     for c in ("satellite", "instrument", "confidence"):
         if c in df:
-            df[c] = df[c].astype(str)
+            # category keeps multi-million-row files (Russia, Angola) in RAM
+            df[c] = df[c].astype("category")
 
     subset = [c for c in ("latitude", "longitude", "acq_date", "acq_time", "satellite") if c in df]
     df = df.drop_duplicates(subset=subset)
@@ -209,8 +236,17 @@ def read_file(path_str: str, mtime: float):
     # MODIS confidence is 0-100, VIIRS uses l/n/h
     lowconf = pd.Series(False, index=df.index)
     if "confidence" in df:
-        c = df["confidence"].str.strip().str.lower()
-        lowconf = (pd.to_numeric(c, errors="coerce") < 30) | c.isin(["l", "low"])
+        c = df["confidence"]
+        if isinstance(c.dtype, pd.CategoricalDtype):
+            cats = c.cat.categories.astype(str).str.strip().str.lower()
+            flags = np.asarray(
+                (pd.to_numeric(cats, errors="coerce") < 30) | cats.isin(["l", "low"])
+            )
+            low_map = dict(zip(c.cat.categories, flags))
+            lowconf = c.map(low_map).fillna(False).astype(bool)
+        else:
+            c = c.astype(str).str.strip().str.lower()
+            lowconf = (pd.to_numeric(c, errors="coerce") < 30) | c.isin(["l", "low"])
 
     # FIRMS type: 0 = vegetation fire, 1-3 = volcano / industrial / offshore
     firms_type = pd.Series(np.nan, index=df.index, dtype="float32")
@@ -536,7 +572,7 @@ def short_text(ratio):
     return f"{ratio:.1f}× usual" if ratio >= 2 else f"{(ratio - 1) * 100:+.0f}% vs usual"
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner="Checking the full archive…")
 def archive_year_stats(path_str, mtime, aoi_wkt, drop_low, veg_only, viirs_mode, seasonal, min_monthly):
     """Year-verdict stats over the whole cleaned archive, ignoring the date
     slider, so the annual stripes stay meaningful for short windows."""
@@ -588,7 +624,7 @@ def archive_year_stats(path_str, mtime, aoi_wkt, drop_low, veg_only, viirs_mode,
     return verdicts, baseline
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner="Checking unusual-activity days…")
 def archive_alert_days(path_str, mtime, aoi_wkt, drop_low, veg_only, viirs_mode, seasonal, min_monthly):
     """Days whose activity ran far above the same day-of-year in other years.
     Archive-scoped like archive_year_stats so short windows still get alerts."""
@@ -1164,9 +1200,9 @@ def base_map(style: str) -> folium.Map:
 
 
 def add_points(m, sub, color_by="sensor", max_points=5000):
-    pts = sub[["latitude", "longitude", "acq_date", "sensor", "platform", "weight", "local_hour"]].copy()
-    pts["sensor"] = pts["sensor"].astype(str)
-    pts["platform"] = pts["platform"].astype(str)
+    # Sample BEFORE any string conversion — astype(str) on 25M rows would
+    # allocate gigabytes of Python strings for a 5k-point display.
+    pts = sub[["latitude", "longitude", "acq_date", "sensor", "platform", "weight", "local_hour"]]
     pts = pts.dropna(subset=["latitude", "longitude"])
     if color_by == "solar":
         pts = pts[pts["local_hour"] >= 0]
@@ -1180,6 +1216,8 @@ def add_points(m, sub, color_by="sensor", max_points=5000):
         per = max(1, max_points // pts[group_col].nunique())
         pts = pd.concat([g.sample(min(len(g), per), random_state=0) for _, g in pts.groupby(group_col)])
 
+    pts["sensor"] = pts["sensor"].astype(str)
+    pts["platform"] = pts["platform"].astype(str)
     dates = pts["acq_date"].dt.strftime("%Y-%m-%d").tolist()
     layer_grp = folium.FeatureGroup(name="Detections")
 
@@ -1256,12 +1294,26 @@ def _cell_feature(la, lo, h, props):
     }
 
 
+def _frame_sig(df):
+    return (len(df), round(float(df["weight"].sum()), 3),
+            str(df["acq_date"].min()), str(df["acq_date"].max()))
+
+
 def add_density(m, sub):
-    cell = 0.05
-    grid = _grid(sub, cell)
-    while len(grid) > 2500 and cell < 5:
-        cell *= 2
+    # Memoize the O(n) grid aggregation — it is identical across reruns that
+    # don't change the underlying detections (e.g. map layer switches).
+    sig = ("dens",) + _frame_sig(sub)
+    cache = st.session_state.setdefault("_dens_cache", {})
+    if sig not in cache:
+        cell = 0.05
         grid = _grid(sub, cell)
+        while len(grid) > 2500 and cell < 5:
+            cell *= 2
+            grid = _grid(sub, cell)
+        if len(cache) > 8:
+            cache.clear()
+        cache[sig] = (cell, grid)
+    cell, grid = cache[sig]
     vmin = max(float(grid["w"].min()), 0.1)
     vmax = max(float(grid["w"].max()), vmin * 1.5)
     norm = colors.LogNorm(vmin=vmin, vmax=vmax, clip=True)
@@ -1297,20 +1349,27 @@ def add_density(m, sub):
 
 
 def add_change(m, sub, recent, base):
-    cell = 0.1
-    while True:
-        gr = _grid(sub[sub["year"].isin(recent)], cell, denom=len(recent))
-        gb = _grid(sub[sub["year"].isin(base)], cell, denom=len(base))
-        mg = gr.merge(gb, on=["glat", "glon"], how="outer", suffixes=("_r", "_b")).fillna(0)
-        if len(mg) <= 2500 or cell >= 5:
-            break
-        cell *= 2
-    mg["d"] = mg["w_r"] - mg["w_b"]
-    lim = max(float(np.percentile(np.abs(mg["d"]), 98)), 0.5)
+    sig = ("chg",) + _frame_sig(sub) + (tuple(recent), tuple(base))
+    cache = st.session_state.setdefault("_chg_cache", {})
+    if sig not in cache:
+        cell = 0.1
+        while True:
+            gr = _grid(sub[sub["year"].isin(recent)], cell, denom=len(recent))
+            gb = _grid(sub[sub["year"].isin(base)], cell, denom=len(base))
+            mg = gr.merge(gb, on=["glat", "glon"], how="outer", suffixes=("_r", "_b")).fillna(0)
+            if len(mg) <= 2500 or cell >= 5:
+                break
+            cell *= 2
+        mg["d"] = mg["w_r"] - mg["w_b"]
+        lim = max(float(np.percentile(np.abs(mg["d"]), 98)), 0.5)
+        mg = mg[mg["d"].abs() >= 0.05 * lim]
+        if len(cache) > 8:
+            cache.clear()
+        cache[sig] = (cell, lim, mg)
+    cell, lim, mg = cache[sig]
     norm = colors.Normalize(vmin=-lim, vmax=lim, clip=True)
     # Purple = fewer fires than baseline, orange = more
     cmap = colormaps["PuOr_r"]
-    mg = mg[mg["d"].abs() >= 0.05 * lim]
     feats = [
         _cell_feature(
             la, lo, cell / 2,
@@ -1890,6 +1949,8 @@ def region_label(key: str) -> str:
 _pending_region = st.session_state.pop("_pending_region", None)
 if _pending_region is not None:
     st.session_state["region_pick"] = _pending_region
+if st.session_state.pop("_clear_region", False):
+    st.session_state["region_pick"] = None
 st.session_state.setdefault("region_pick", None)
 
 sb = st.sidebar
@@ -1906,6 +1967,14 @@ if match is not None:
     # _land_obj is a per-map click signature that must persist so stale
     # component values can't replay when returning to a previous map.
     st.session_state["_had_region"] = True
+    if sb.button(
+        "← All countries",
+        key="back_to_world",
+        help="Return to the world map to open a different country.",
+    ):
+        st.session_state["_clear_region"] = True
+        st.session_state.pop("_pending_region", None)
+        st.rerun()
 elif st.session_state.pop("_had_region", False):
     # Returning to the world map: bump the epoch so the Folium component
     # remounts with a clean slate — st_folium's click values are sticky.
@@ -2171,16 +2240,22 @@ def render_map(msub, tag="all", height=640):
     # Clickable country overlay (loaded archives) — mounted under the detection
     # layers on every map so another country can be opened with one click,
     # even after zooming into a region.
-    loaded_keys = [k for k in regions if has_data(k) and k in geoms_wkb and k not in ALIASES]
+    loaded_keys = tuple(k for k in regions if has_data(k) and k in geoms_wkb and k not in ALIASES)
     if loaded_keys:
-        feats = []
-        for k in loaded_keys:
-            g = shapely.from_wkb(geoms_wkb[k])
-            feats.append({
-                "type": "Feature",
-                "properties": {"region": k.title(), "key": k, "status": "Ready ● · click to open"},
-                "geometry": mapping(g),
-            })
+        cc = st.session_state.setdefault("_ccache", {})
+        if loaded_keys not in cc:
+            if len(cc) > 4:
+                cc.clear()
+            lf = []
+            for k in loaded_keys:
+                g = shapely.from_wkb(geoms_wkb[k])
+                lf.append({
+                    "type": "Feature",
+                    "properties": {"region": k.title(), "key": k, "status": "Ready ● · click to open"},
+                    "geometry": mapping(g),
+                })
+            cc[loaded_keys] = lf
+        feats = cc[loaded_keys]
         folium.GeoJson(
             {"type": "FeatureCollection", "features": feats},
             style_function=lambda f: {
