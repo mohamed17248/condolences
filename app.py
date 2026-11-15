@@ -1188,6 +1188,10 @@ def base_map(style: str) -> folium.Map:
         tiles=None,
         min_zoom=2,
         max_zoom=16,
+        # Keep the viewport inside the world so panning can't drift into the
+        # grey void left of/right of the dateline.
+        max_bounds=[[-85.06, -180.0], [85.06, 180.0]],
+        max_bounds_viscosity=1.0,
     )
     cfg = TILES[style]
     if cfg:
