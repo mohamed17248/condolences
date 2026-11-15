@@ -15,7 +15,6 @@ import json
 import re
 import unicodedata
 from html import escape
-from itertools import combinations
 from pathlib import Path
 
 import folium
@@ -151,35 +150,19 @@ WANTED = {
     "confidence", "brightness", "bright_ti4", "type", "frp",
 }
 
-PLATFORM_MAP = {
-    "N": "SNPP", "NPP": "SNPP", "SNPP": "SNPP", "S-NPP": "SNPP", "SUOMI-NPP": "SNPP",
-    "1": "NOAA-20", "1.0": "NOAA-20", "N20": "NOAA-20", "NOAA-20": "NOAA-20", "NOAA20": "NOAA-20",
-    "2": "NOAA-21", "2.0": "NOAA-21", "N21": "NOAA-21", "NOAA-21": "NOAA-21", "NOAA21": "NOAA-21",
-    "T": "Terra", "TERRA": "Terra",
-    "A": "Aqua", "AQUA": "Aqua",
-}
-MODIS_PLATFORMS = {"Terra", "Aqua"}
-VIIRS_PLATFORMS = {"SNPP", "NOAA-20", "NOAA-21"}
-
-
-def normalize_platform(sat: pd.Series) -> pd.Series:
-    # Category-level mapping: avoids materializing millions of Python strings
-    # on huge country files (Russia ~25M rows).
-    if isinstance(sat.dtype, pd.CategoricalDtype):
-        sat_cats = list(sat.cat.categories)
-        plat_per_cat = [
-            PLATFORM_MAP.get(str(c).strip().upper(), "UNKNOWN") for c in sat_cats
-        ]
-        plat_cats = sorted(set(plat_per_cat))
-        lookup = np.array([plat_cats.index(p) for p in plat_per_cat], dtype=np.int16)
-        codes = sat.cat.codes.to_numpy()
-        new_codes = np.where(codes >= 0, lookup[np.clip(codes, 0, None)], -1).astype(np.int16)
-        return pd.Series(
-            pd.Categorical.from_codes(new_codes, categories=plat_cats),
-            index=sat.index,
-        )
-    s = sat.astype(str).str.strip().str.upper()
-    return s.map(PLATFORM_MAP).fillna("UNKNOWN")
+from firecore import (
+    MODIS_PLATFORMS,
+    VIIRS_PLATFORMS,
+    level_for,
+    normalize_platform,
+    ordinal,
+    rank_text,
+    rel_trend,
+    short_text,
+    size_text,
+    status_for,
+    theil_sen,
+)
 
 
 def infer_sensor(df: pd.DataFrame, platform: pd.Series) -> pd.Series:
@@ -206,7 +189,7 @@ def infer_sensor(df: pd.DataFrame, platform: pd.Series) -> pd.Series:
     return pd.Categorical.from_codes(codes, categories=["MODIS", "VIIRS", "UNKNOWN"])
 
 
-@st.cache_resource
+@st.cache_resource(max_entries=8)
 def read_file(path_str: str, mtime: float):
     path = Path(path_str)
     if path.suffix.lower() == ".parquet":
@@ -300,10 +283,27 @@ def read_file(path_str: str, mtime: float):
     return out, flags
 
 
-@st.cache_resource(show_spinner="Calibrating MODIS and VIIRS records…")
-def build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly):
+# Approximate FIRMS data start per platform (launch + commissioning to routine
+# operations). A quiet region's first detection can lag the real start by
+# years, which would under-count the active constellation, so per-satellite
+# weights use these dates rather than the file's first_seen.
+PLATFORM_START = {
+    "Terra": pd.Timestamp("2000-11-01"),
+    "Aqua": pd.Timestamp("2002-07-01"),
+    "SNPP": pd.Timestamp("2012-01-01"),
+    "NOAA-20": pd.Timestamp("2018-01-01"),
+    "NOAA-21": pd.Timestamp("2023-01-01"),
+}
+
+
+@st.cache_resource(max_entries=4, show_spinner="Calibrating MODIS and VIIRS records…")
+def build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly, calib_end_year):
     raw, flags = read_file(path_str, mtime)
     first_seen = raw.groupby("platform", observed=True)["acq_date"].min()
+    active_since = first_seen.copy()
+    for plat, start in PLATFORM_START.items():
+        if plat in active_since.index:
+            active_since.loc[plat] = min(active_since.loc[plat], start)
 
     df = raw
     if drop_low:
@@ -326,7 +326,7 @@ def build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min
         if not mask.any():
             continue
         plats = [str(p) for p in df.loc[mask, "platform"].unique()]
-        firsts = np.sort(first_seen.reindex(plats).to_numpy(dtype="datetime64[ns]"))
+        firsts = np.sort(active_since.reindex(plats).to_numpy(dtype="datetime64[ns]"))
         dates = df.loc[mask, "acq_date"].to_numpy(dtype="datetime64[ns]")
         n_active = np.searchsorted(firsts, dates, side="right")
         w0[mask] = 1.0 / np.maximum(n_active, 1)
@@ -373,9 +373,12 @@ def build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min
                 monthly[s] = 0.0
         ov = monthly.loc[monthly.index >= split, ["MODIS", "VIIRS"]].copy()
 
-        valid = (ov["MODIS"] >= min_monthly) & (ov["VIIRS"] >= min_monthly)
+        # Recent overlap months are excluded from the fit: Terra/Aqua orbit
+        # drift since ~2020 shifts overpass times and biases the ratio.
+        year_ok = ov.index.year <= calib_end_year
+        valid = (ov["MODIS"] >= min_monthly) & (ov["VIIRS"] >= min_monthly) & year_ok
         if valid.sum() < 6:
-            valid = (ov["MODIS"] > 0) & (ov["VIIRS"] > 0)
+            valid = (ov["MODIS"] > 0) & (ov["VIIRS"] > 0) & year_ok
         ov["ratio"] = ov["VIIRS"] / ov["MODIS"].replace(0, np.nan)
         ov["valid"] = valid
 
@@ -444,25 +447,6 @@ def build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min
     return df.reset_index(drop=True), info
 
 
-def theil_sen(x, y):
-    x = np.asarray(x, float)
-    y = np.asarray(y, float)
-    slopes = [(y[j] - y[i]) / (x[j] - x[i]) for i, j in combinations(range(len(x)), 2)]
-    slope = float(np.median(slopes))
-    return slope, float(np.median(y - slope * x))
-
-
-def rel_trend(series: pd.Series, years_full):
-    if len(years_full) < 5:
-        return None
-    y = series.reindex(years_full).fillna(0).to_numpy(float)
-    med = float(np.median(y))
-    if med <= 0:
-        return None
-    slope, icpt = theil_sen(years_full, y)
-    return slope / med * 100, slope, icpt
-
-
 def circle_polygon(lon, lat, radius_m, n=72):
     ang = np.linspace(0, 2 * np.pi, n, endpoint=False)
     dlat = (radius_m / 111320.0) * np.sin(ang)
@@ -501,82 +485,15 @@ def apply_aoi(df: pd.DataFrame, poly) -> pd.DataFrame:
     return near[inside]
 
 
-def status_for(current: float, hist: pd.Series):
-    n = len(hist)
-    med = float(hist.median())
-    pct = ((hist < current).sum() + 0.5 * (hist == current).sum()) / n * 100
-    rank = int((hist > current).sum()) + 1
-    if current == 0 and med == 0:
-        label, level = "typical (no detections in most years)", "normal"
-    elif pct < 25:
-        label, level = "below the normal range", "low"
-    elif pct <= 75:
-        label, level = "within the normal range", "normal"
-    elif pct <= 90:
-        label, level = "above normal", "elevated"
-    else:
-        label, level = "unusually high", "high"
-    return dict(label=label, level=level, pct=pct, rank=rank, n=n + 1, median=med)
-
-
-def ordinal(n: int) -> str:
-    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
-    return f"{n}{suffix}"
-
-
 def fmt(n) -> str:
     return f"{n:,.0f}"
 
 
-YEAR_LEVELS = [
-    (1.5, "much_more", "A much heavier fire year than usual", "Running far above usual so far"),
-    (1.2, "more", "More fire than usual", "Running above usual so far"),
-    (0.8, "typical", "A typical fire year", "Tracking a typical year so far"),
-    (0.6, "less", "Quieter than usual", "Running below usual so far"),
-    (0.0, "much_less", "Much quieter than usual", "Running far below usual so far"),
-]
-
-
-def level_for(ratio):
-    for lo, key, head, ytd_head in YEAR_LEVELS:
-        if ratio >= lo:
-            return key, head, ytd_head
-    return YEAR_LEVELS[-1][1:]
-
-
-def size_text(ratio, unit="the usual year"):
-    if ratio is None:
-        return "with no baseline year to compare"
-    if ratio >= 2:
-        return f"{ratio:.1f}× {unit}"
-    if ratio >= 1.05:
-        return f"{(ratio - 1) * 100:.0f}% above {unit}"
-    if ratio <= 0.95:
-        return f"{(1 - ratio) * 100:.0f}% below {unit}"
-    return f"right at {unit}"
-
-
-def rank_text(rank, n, noun):
-    if n >= 3 and rank == 1:
-        return f"It is the highest of {n} {noun}."
-    if n >= 3 and rank == n:
-        return f"It is the lowest of {n} {noun}."
-    return f"It ranks {ordinal(rank)} highest of {n} {noun}."
-
-
-def short_text(ratio):
-    if ratio is None:
-        return ""
-    if abs(ratio - 1) < 0.005:
-        return "at the usual level"
-    return f"{ratio:.1f}× usual" if ratio >= 2 else f"{(ratio - 1) * 100:+.0f}% vs usual"
-
-
-@st.cache_data(show_spinner="Checking the full archive…")
-def archive_year_stats(path_str, mtime, aoi_wkt, drop_low, veg_only, viirs_mode, seasonal, min_monthly):
+@st.cache_data(show_spinner="Checking the full archive…", max_entries=8)
+def archive_year_stats(path_str, mtime, aoi_wkt, drop_low, veg_only, viirs_mode, seasonal, min_monthly, calib_end_year):
     """Year-verdict stats over the whole cleaned archive, ignoring the date
     slider, so the annual stripes stay meaningful for short windows."""
-    hot, _ = build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly)
+    hot, _ = build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly, calib_end_year)
     arch = apply_aoi(hot, shapely_wkt.loads(aoi_wkt)) if aoi_wkt else hot
     if arch.empty:
         return None
@@ -624,11 +541,11 @@ def archive_year_stats(path_str, mtime, aoi_wkt, drop_low, veg_only, viirs_mode,
     return verdicts, baseline
 
 
-@st.cache_data(show_spinner="Checking unusual-activity days…")
-def archive_alert_days(path_str, mtime, aoi_wkt, drop_low, veg_only, viirs_mode, seasonal, min_monthly):
+@st.cache_data(show_spinner="Checking unusual-activity days…", max_entries=8)
+def archive_alert_days(path_str, mtime, aoi_wkt, drop_low, veg_only, viirs_mode, seasonal, min_monthly, calib_end_year):
     """Days whose activity ran far above the same day-of-year in other years.
     Archive-scoped like archive_year_stats so short windows still get alerts."""
-    hot, _ = build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly)
+    hot, _ = build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly, calib_end_year)
     arch = apply_aoi(hot, shapely_wkt.loads(aoi_wkt)) if aoi_wkt else hot
     if arch.empty:
         return None
@@ -859,12 +776,13 @@ def derive_field_notes(sub: pd.DataFrame, med_by_month: pd.Series, info: dict, v
     # Heuristic only: VIIRS catches tiny burns MODIS misses, so a high factor plus a
     # sharp seasonal window is *consistent with* crop-residue burning, not proof of it.
     if info.get("has_both") and factor >= 3.2 and top2_share >= 0.50:
-        driver_tag = "Heuristic: likely crop-residue burning"
+        driver_tag = "Heuristic: possible crop-residue signature"
         driver_head = "Small, brief fires clustered around harvest windows"
         driver_body = (
             f"VIIRS picks up {factor:.1f}× more hotspots here than 1 km MODIS, and {top2_share * 100:.0f}% "
-            f"of typical annual burning lands in just two peak months — a pattern consistent with "
-            f"post-harvest agricultural stubble clearing, though other small-fire regimes can look similar."
+            f"of typical annual burning lands in just two peak months — a pattern sometimes produced by "
+            f"post-harvest agricultural stubble clearing. This is a hypothesis only: rotational farming, "
+            f"pasture management, and other small-fire regimes can produce the same signature."
         )
     elif bimodal_pair is not None:
         driver_tag = "Two-season burn cycle"
@@ -924,8 +842,8 @@ def derive_field_notes(sub: pd.DataFrame, med_by_month: pd.Series, info: dict, v
             clock_tag = "Overpass diagnostic: day-weighted"
             clock_head = f"{day_share * 100:.0f}% of weight sits in the 06:00–18:00 window"
             clock_body = (
-                f"As with the night-weighted case, the 06:00–18:00 share largely reflects the fixed "
-                f"afternoon overpass schedule of the constellation rather than real diurnal fire behaviour."
+                f"The 06:00–18:00 share largely reflects the fixed afternoon overpass "
+                f"schedule of the constellation rather than real diurnal fire behaviour."
             )
         notes.append(dict(key="clock", tag=clock_tag, head=clock_head, body=clock_body))
 
@@ -975,8 +893,12 @@ def derive_field_notes(sub: pd.DataFrame, med_by_month: pd.Series, info: dict, v
             f"(gas flares, cement kilns, smelters, or volcanic vents); the vegetation-only filter removed them."
         )
     elif "Terra" in first_seen and "SNPP" in first_seen:
+        if verdicts:
+            span_years = max(v["year"] for v in verdicts) - min(v["year"] for v in verdicts)
+        else:
+            span_years = int(sub["acq_date"].max().year - sub["acq_date"].min().year)
         orb_tag = "Orbital handoff"
-        orb_head = f"25+ years bridged across {len(first_seen)} spacecraft"
+        orb_head = f"{span_years}+ years bridged across {len(first_seen)} spacecraft"
         orb_body = (
             f"NASA Terra began logging hotspots here in {first_seen['Terra']:%b %Y}, joined by Aqua in "
             f"{first_seen.get('Aqua', first_seen['Terra']):%b %Y}, before Suomi-NPP VIIRS took over in "
@@ -1219,7 +1141,7 @@ def add_points(m, sub, color_by="sensor", max_points=5000):
     group_col = "tod" if color_by == "solar" else "sensor"
     if n_all > max_points:
         per = max(1, max_points // pts[group_col].nunique())
-        pts = pd.concat([g.sample(min(len(g), per), random_state=0) for _, g in pts.groupby(group_col)])
+        pts = pd.concat([g.sample(min(len(g), per), random_state=0) for _, g in pts.groupby(group_col, observed=True)])
 
     pts["sensor"] = pts["sensor"].astype(str)
     pts["platform"] = pts["platform"].astype(str)
@@ -2057,6 +1979,14 @@ with sb.expander("Quality and harmonization"):
         10,
         help="Months below this threshold are skipped when estimating the scaling ratio.",
     )
+    calib_year = st.number_input(
+        "Calibrate MODIS→VIIRS through year",
+        2012,
+        pd.Timestamp.today().year,
+        2019,
+        help="Overlap months after this year are excluded from the scaling fit. "
+        "Terra/Aqua orbit drift in recent years can bias the ratio.",
+    )
 
 # Load and filter dataset
 sub, info = None, None
@@ -2080,6 +2010,7 @@ if match:
                 "snpp" if viirs_mode.startswith("SNPP") else "all",
                 scaling.startswith("By"),
                 int(min_monthly),
+                int(calib_year),
             )
         except Exception as e:
             st.error(f"Could not process {path.name}: {e}")
@@ -2192,6 +2123,15 @@ if sub is not None:
     full_years = [y for y in years if full.loc[y].all()]
     trend_h = rel_trend(annual_total, full_years)
     trend_raw = rel_trend(annual_raw, full_years)
+    # Honesty check: a trend fitted only on VIIRS-era years does not depend on
+    # the MODIS->VIIRS scaling factor at all.
+    viirs_years = [
+        y for y in full_years
+        if info["split"] is not None and y >= info["split"].year
+    ]
+    trend_viirs = rel_trend(annual_total, viirs_years)
+    # FIRMS tails are near-real-time for roughly the last ~3-4 months.
+    nrt_recent = bool((pd.Timestamp.today().normalize() - pd.Timestamp(dmax)) < pd.Timedelta(days=120))
 
     latest = sub["acq_date"].max()
     ly, lm, last_day = latest.year, latest.month, latest.day
@@ -2213,7 +2153,7 @@ if sub is not None:
         aoi_poly.wkt if aoi_poly is not None else None,
         drop_low, veg_only,
         "snpp" if viirs_mode.startswith("SNPP") else "all",
-        scaling.startswith("By"), int(min_monthly),
+        scaling.startswith("By"), int(min_monthly), int(calib_year),
     )
     verdicts, year_baseline = arch_stats if arch_stats is not None else ([], None)
     vmap = {v["year"]: v for v in verdicts}
@@ -2222,7 +2162,7 @@ if sub is not None:
         aoi_poly.wkt if aoi_poly is not None else None,
         drop_low, veg_only,
         "snpp" if viirs_mode.startswith("SNPP") else "all",
-        scaling.startswith("By"), int(min_monthly),
+        scaling.startswith("By"), int(min_monthly), int(calib_year),
     )
     region_text = match_title + (" (selected area)" if aoi_poly is not None else "")
     has_frp = bool(info["flags"].get("has_frp"))
@@ -2447,7 +2387,11 @@ def source_class_summary(df: pd.DataFrame) -> pd.DataFrame:
     """
     if "firms_type" not in df:
         df = df.assign(firms_type=np.nan)
-    key = df["latitude"].round(2).astype(str) + "|" + df["longitude"].round(2).astype(str)
+    # Integer cell key (~0.01°): avoids building millions of Python strings on
+    # large countries where the old "lat|lon" key would dominate runtime.
+    lat_i = np.round(df["latitude"].to_numpy(float) * 100).astype(np.int64)
+    lon_i = np.round(df["longitude"].to_numpy(float) * 100).astype(np.int64)
+    key = lat_i * 100000 + (lon_i + 18000)
     cell = df.groupby(key, sort=False).agg(
         days=("acq_date", "nunique"),
         months=("month", "nunique"),
@@ -2718,7 +2662,12 @@ def render_overview():
             ci_txt = f" (range {ci[0]:.2f}–{ci[1]:.2f})" if ci else ""
             st.caption(
                 f"MODIS scaled ×{info['factor']:.2f}{ci_txt} to VIIRS-equivalent from {info['n_valid']} "
-                f"overlap months. {fmt(info['n_final'])} of {fmt(info['n_raw'])} detections kept."
+                f"overlap months (fit through {calib_year}). {fmt(info['n_final'])} of {fmt(info['n_raw'])} detections kept."
+            )
+        if nrt_recent:
+            st.caption(
+                "The tail of this record may be near-real-time (NRT) detections rather than the "
+                "standard reprocessed product, so the most recent weeks carry extra uncertainty."
             )
 
     with right:
@@ -2819,7 +2768,12 @@ if sub is not None:
             f'<p class="lede">{escape(years_summary(verdicts, region_text, year_baseline))}</p>',
             unsafe_allow_html=True,
         )
-        opts = [v["year"] for v in verdicts]
+        # verdicts spans the whole archive but pivot_cov only covers the
+        # selected window — offering an outside year would KeyError on .loc.
+        opts = [v["year"] for v in verdicts if v["year"] in pivot_cov.index]
+        if not opts:
+            st.info("No rated years inside the selected period.")
+            st.stop()
         yc1, yc2 = st.columns([3, 1], gap="medium")
         pick = yc1.select_slider(
             "Year in focus",
@@ -2999,7 +2953,10 @@ if sub is not None:
             show(tidy(hfig, "24-hour local solar burn clock (sun-synchronous overpass timing)", 300), "diurnal")
             st.caption(
                 "Approximate local solar hour derived from UTC acquisition time and longitude. "
-                "Peaks reflect when fires are active during Terra (~10:30/22:30) and Aqua/VIIRS (~13:30/01:30) passes."
+                "Because MODIS and VIIRS only observe at fixed sun-synchronous overpass times "
+                "(Terra ~10:30/22:30, Aqua/VIIRS ~13:30/01:30 local), this chart shows when the "
+                "satellites were looking — it is an overpass-timing diagnostic, not a measure of "
+                "when fires actually burn."
             )
 
         flat = (
@@ -3104,6 +3061,19 @@ if sub is not None:
         show(tidy(ann, "Annual detections, VIIRS-equivalent (partial years included)"), "annual")
         if ci and not scaling.startswith("By"):
             st.caption("Whiskers on the MODIS-derived bars show the bootstrap range of the scaling factor.")
+        trend_bits = []
+        if trend_h is not None:
+            trend_bits.append(f"all complete years {trend_h[0]:+.1f}%/yr")
+        if trend_viirs is not None:
+            trend_bits.append(
+                f"VIIRS era only ({viirs_years[0]}+, {len(viirs_years)} yrs) {trend_viirs[0]:+.1f}%/yr"
+            )
+        if trend_bits:
+            st.caption(
+                "Theil-Sen trend — " + "; ".join(trend_bits) + ". "
+                "The VIIRS-era figure uses only post-splice years, so it does not depend on the "
+                "MODIS scaling factor; a large gap between the two is a red flag for calibration bias."
+            )
 
         if cmp_mode == "Same dates, previous year":
             d0p = (pd.Timestamp(d0) - pd.DateOffset(years=1)).date()
@@ -3377,7 +3347,7 @@ if sub is not None:
                 f'<div class="method-item"><b>2. Per-satellite weight</b>'
                 f"<p>Each detection is divided by the active satellite count of its sensor on that date.</p></div>"
                 f'<div class="method-item"><b>3. Cross-calibration</b>'
-                f'<p>From {split:%B %Y}, overlapping months give a median VIIRS / MODIS ratio of ×{info["factor"]:.2f} across the full file.</p></div>'
+                f'<p>From {split:%B %Y}, overlapping months up to {calib_year} give a median VIIRS / MODIS ratio of ×{info["factor"]:.2f} across the full file; later months are excluded to limit orbit-drift bias.</p></div>'
                 f'<div class="method-item"><b>4. Splice</b>'
                 f"<p>Scaled MODIS covers the record before {split:%B %Y}; VIIRS covers {split:%B %Y} onward without double-counting.</p></div>"
                 f"</div>",
@@ -3424,6 +3394,12 @@ if sub is not None:
                     "Trend without vs with scaling",
                     "n/a",
                     help="Needs at least five complete years in the selected range.",
+                )
+            if aoi_poly is not None:
+                st.caption(
+                    "The scaling factor is fitted on the whole region file, not this drawn area — "
+                    "the true MODIS/VIIRS ratio can differ regionally, so treat scaled values here "
+                    "as approximate."
                 )
 
             ov = info["overlap"]
@@ -3546,6 +3522,25 @@ if sub is not None:
                 with st.expander("Monthly scaling factors"):
                     st.dataframe(tbl, hide_index=True)
 
+        with st.expander("Methods and limitations"):
+            st.markdown(
+                "- **Counts are detections, not area or emissions.** One fire produces many "
+                "detections; FRP is an intensity proxy, not a burned-area measurement.\n"
+                "- **The scaling factor is regional.** It is fitted on the whole country file, "
+                "not each drawn AOI, and can differ between land-cover types.\n"
+                "- **MODIS misses small fires.** Scaling matches monthly totals but cannot "
+                "recover the sub-pixel detail VIIRS sees after 2012.\n"
+                "- **Orbit drift is only partly handled.** Calibration can be capped at a "
+                "chosen year, but Terra/Aqua overpass drift since ~2020 is not fully corrected.\n"
+                "- **Recent data may be NRT.** The tail of a fresh download can be "
+                "near-real-time rather than standard reprocessed quality.\n"
+                "- **Source classes are conservative.** 'Industrial / static' requires a cell "
+                "to recur year-round on many days; everything else stays 'unresolved' because "
+                "FIRMS alone cannot separate field burning from wildfire.\n"
+                "- **Sensor steps are constellation changes,** not fire changes — see the raw "
+                "continuity chart above."
+            )
+
     else:
         key = (match, str(d0), str(d1), drop_low, veg_only, viirs_mode, scaling, int(min_monthly),
                round(path.stat().st_mtime, 1), aoi_key)
@@ -3605,6 +3600,8 @@ if sub is not None:
             report += ["", "## Field notes"] + [f"- **{n['tag']}** — {n['head']}: {n['body']}" for n in field_notes]
         if trend_h is not None:
             report += ["", f"Annual trend over {len(full_years)} complete years: {trend_h[0]:+.1f}% per year (Theil-Sen)."]
+        if trend_viirs is not None:
+            report += [f"VIIRS-era-only trend ({viirs_years[0]}+): {trend_viirs[0]:+.1f}% per year, independent of the MODIS scaling factor."]
         if not flat.empty:
             report += ["", "## Most active months"] + [
                 f"- {calendar.month_abbr[int(r.month)]} {int(r.year)}: {r.n:,.0f}"
