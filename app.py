@@ -1182,7 +1182,7 @@ MAP_LEGEND_STYLE = (
 def base_map(style: str) -> folium.Map:
     m = folium.Map(
         location=[18, 12],
-        zoom_start=2,
+        zoom_start=4,
         control_scale=True,
         prefer_canvas=True,
         tiles=None,
