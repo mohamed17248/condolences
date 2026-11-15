@@ -1,6 +1,6 @@
 """
 
-Fire Activity Explorer made by Ahmed sultan & Mohamed abbas (queriesonhold/egobreaking & mohamed17248)
+The Burn Record made by Ahmed sultan & Mohamed abbas (queriesonhold/egobreaking & mohamed17248)
 Run:    streamlit run app.py
 Data:   FIRMS archive downloads (https://firms.modaps.eosdis.nasa.gov/download/)
         saved in ./data/<country>.csv or ./data/<country>.parquet
@@ -35,7 +35,7 @@ from shapely.geometry import Point, Polygon, box, mapping, shape
 from streamlit_folium import st_folium
 
 st.set_page_config(
-    page_title="Fire Activity Explorer",
+    page_title="The Burn Record",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -2473,7 +2473,7 @@ if sub is not None:
     _span_txt = f"{_sy} year{'' if _sy == 1 else 's'} of satellite fire detections"
 st.markdown(
     f'<div class="masthead">'
-    f"<div><h1>Fire Activity Explorer</h1>"
+    f"<div><h1>The Burn Record</h1>"
     f'<p class="sub">{_span_txt} calibrated across MODIS and VIIRS, '
     f"so any month, country, or custom polygon can be read against its historical baseline.</p></div>"
     f"{telemetry_html}"
