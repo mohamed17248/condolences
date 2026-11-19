@@ -351,10 +351,26 @@ def read_file(path_str: str, mtime: float):
     return out, flags
 
 
+# Approximate FIRMS data start per platform (launch + commissioning). A quiet
+# region's first detection can lag the real start by years, which would
+# under-count the active constellation — weights use these, not first_seen.
+PLATFORM_START = {
+    "Terra": pd.Timestamp("2000-11-01"),
+    "Aqua": pd.Timestamp("2002-07-01"),
+    "SNPP": pd.Timestamp("2012-01-01"),
+    "NOAA-20": pd.Timestamp("2018-01-01"),
+    "NOAA-21": pd.Timestamp("2023-01-01"),
+}
+
+
 @st.cache_resource(show_spinner="Calibrating MODIS and VIIRS records…", max_entries=3)
-def build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly):
+def build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly, calib_end_year=None):
     raw, flags = read_file(path_str, mtime)
     first_seen = raw.groupby("platform", observed=True)["acq_date"].min()
+    active_since = first_seen.copy()
+    for plat, start in PLATFORM_START.items():
+        if plat in active_since.index:
+            active_since.loc[plat] = min(active_since.loc[plat], start)
 
     df = raw
     if drop_low:
@@ -377,7 +393,7 @@ def build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min
         if not mask.any():
             continue
         plats = [str(p) for p in df.loc[mask, "platform"].unique()]
-        firsts = np.sort(first_seen.reindex(plats).to_numpy(dtype="datetime64[ns]"))
+        firsts = np.sort(active_since.reindex(plats).to_numpy(dtype="datetime64[ns]"))
         dates = df.loc[mask, "acq_date"].to_numpy(dtype="datetime64[ns]")
         n_active = np.searchsorted(firsts, dates, side="right")
         w0[mask] = 1.0 / np.maximum(n_active, 1)
@@ -424,9 +440,12 @@ def build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min
                 monthly[s] = 0.0
         ov = monthly.loc[monthly.index >= split, ["MODIS", "VIIRS"]].copy()
 
-        valid = (ov["MODIS"] >= min_monthly) & (ov["VIIRS"] >= min_monthly)
+        # Recent overlap months are excluded from the fit: Terra/Aqua orbit
+        # drift since ~2020 shifts overpass times and biases the ratio.
+        year_ok = ov.index.year <= calib_end_year if calib_end_year else True
+        valid = (ov["MODIS"] >= min_monthly) & (ov["VIIRS"] >= min_monthly) & year_ok
         if valid.sum() < 6:
-            valid = (ov["MODIS"] > 0) & (ov["VIIRS"] > 0)
+            valid = (ov["MODIS"] > 0) & (ov["VIIRS"] > 0) & year_ok
         ov["ratio"] = ov["VIIRS"] / ov["MODIS"].replace(0, np.nan)
         ov["valid"] = valid
 
@@ -498,11 +517,11 @@ def build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min
 
 
 @st.cache_resource(show_spinner=False, max_entries=6)
-def get_sub(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly, d0, d1, aoi_wkt):
+def get_sub(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly, d0, d1, aoi_wkt, calib_end_year=None):
     """The cleaned record restricted to a date range and (optionally) an area.
     Cached as a resource so reruns reuse the same frame instead of re-filtering
     millions of rows. Treat the result as read-only."""
-    hot, info = build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly)
+    hot, info = build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly, calib_end_year)
     lo, hi = pd.Timestamp(d0), pd.Timestamp(d1)
     if info["dmin"] is not None and lo.date() <= info["dmin"] and hi.date() >= info["dmax"]:
         sub = hot  # full range: no copy
@@ -656,10 +675,10 @@ def _month_masks(pivot, lo, hi, tol=pd.Timedelta(days=3)):
 
 
 @st.cache_data(show_spinner="Checking the full archive…", max_entries=6)
-def archive_year_stats(path_str, mtime, aoi_wkt, drop_low, veg_only, viirs_mode, seasonal, min_monthly):
+def archive_year_stats(path_str, mtime, aoi_wkt, drop_low, veg_only, viirs_mode, seasonal, min_monthly, calib_end_year=None):
     """Year-verdict stats over the whole cleaned archive, ignoring the date
     slider, so the annual stripes stay meaningful for short windows."""
-    hot, _ = build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly)
+    hot, _ = build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly, calib_end_year)
     arch = apply_aoi(hot, shapely_wkt.loads(aoi_wkt)) if aoi_wkt else hot
     if arch.empty:
         return None
@@ -703,10 +722,10 @@ def archive_year_stats(path_str, mtime, aoi_wkt, drop_low, veg_only, viirs_mode,
 
 
 @st.cache_data(show_spinner="Checking unusual-activity days…", max_entries=6)
-def archive_alert_days(path_str, mtime, aoi_wkt, drop_low, veg_only, viirs_mode, seasonal, min_monthly):
+def archive_alert_days(path_str, mtime, aoi_wkt, drop_low, veg_only, viirs_mode, seasonal, min_monthly, calib_end_year=None):
     """Days whose activity ran far above the same day-of-year in other years.
     Archive-scoped like archive_year_stats so short windows still get alerts."""
-    hot, _ = build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly)
+    hot, _ = build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly, calib_end_year)
     arch = apply_aoi(hot, shapely_wkt.loads(aoi_wkt)) if aoi_wkt else hot
     if arch.empty:
         return None
@@ -896,6 +915,12 @@ def years_summary(vs, region_text, baseline):
     return text
 
 
+def _arch_span(verdicts, sub) -> int:
+    if verdicts:
+        return max(v["year"] for v in verdicts) - min(v["year"] for v in verdicts)
+    return int(sub["acq_date"].max().year - sub["acq_date"].min().year)
+
+
 def derive_field_notes(sub: pd.DataFrame, med_by_month: pd.Series, info: dict, verdicts: list, region_text: str, veg_only: bool = True):
     """Synthesize plain-English fire regime clues, diurnal clock stats, and archive records from live data."""
     notes = []
@@ -1050,7 +1075,7 @@ def derive_field_notes(sub: pd.DataFrame, med_by_month: pd.Series, info: dict, v
         )
     elif "Terra" in first_seen and "SNPP" in first_seen:
         orb_tag = "Orbital handoff"
-        orb_head = f"25+ years bridged across {len(first_seen)} spacecraft"
+        orb_head = f"{_arch_span(verdicts, sub)}+ years bridged across {len(first_seen)} spacecraft"
         orb_body = (
             f"NASA Terra began logging hotspots here in {first_seen['Terra']:%b %Y}, joined by Aqua in "
             f"{first_seen.get('Aqua', first_seen['Terra']):%b %Y}, before Suomi-NPP VIIRS took over in "
@@ -1639,9 +1664,9 @@ def analyze(skey, region_text):
     """Every summary number the page needs for one (file, filters, period, area)
     combination. Cached, so clicking around the interface no longer re-runs
     group-bys over millions of rows."""
-    (path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly, d0, d1, aoi_wkt) = skey
+    (path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly, d0, d1, aoi_wkt, calib_end_year) = skey
     sub = get_sub(*skey)
-    _, info = build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly)
+    _, info = build_dataset(path_str, mtime, drop_low, veg_only, viirs_mode, seasonal, min_monthly, calib_end_year)
 
     lo, hi = pd.Timestamp(d0), pd.Timestamp(d1)
     first_y, last_y = int(sub["year"].min()), int(sub["year"].max())
@@ -1675,15 +1700,27 @@ def analyze(skey, region_text):
     )
     status = status_for(current, hist) if len(hist) > 0 else None
 
-    arch = archive_year_stats(path_str, mtime, aoi_wkt, drop_low, veg_only, viirs_mode, seasonal, min_monthly)
+    arch = archive_year_stats(path_str, mtime, aoi_wkt, drop_low, veg_only, viirs_mode, seasonal, min_monthly, calib_end_year)
     if arch is None:
         verdicts, year_baseline, arch_cov, arch_full = [], None, None, None
     else:
         verdicts, year_baseline, arch_cov, arch_full = arch
-    alert_days = archive_alert_days(path_str, mtime, aoi_wkt, drop_low, veg_only, viirs_mode, seasonal, min_monthly)
+    alert_days = archive_alert_days(path_str, mtime, aoi_wkt, drop_low, veg_only, viirs_mode, seasonal, min_monthly, calib_end_year)
 
     has_frp = bool(info["flags"].get("has_frp"))
     field_notes = derive_field_notes(sub, med_by_month, info, verdicts, region_text, veg_only)
+
+    # Honesty check: a trend fitted only on VIIRS-era years does not depend on
+    # the MODIS->VIIRS scaling factor. The split year itself still contains
+    # scaled MODIS months, so start strictly after it.
+    first_clean = (
+        info["split"].year + (1 if info["split"].month > 1 else 0)
+        if info["split"] is not None else None
+    )
+    viirs_years = [y for y in full_years if first_clean is not None and y >= first_clean]
+    trend_viirs = rel_trend(annual_total, viirs_years)
+    dmax_dt = sub["acq_date"].max()
+    nrt_recent = bool((pd.Timestamp.today().normalize() - dmax_dt) < pd.Timedelta(days=120))
 
     monthly_agg = (
         sub.groupby(["year", "month"])
@@ -1698,6 +1735,7 @@ def analyze(skey, region_text):
         annual_by_sensor=annual_by_sensor, annual_total=annual_total, annual_raw=annual_raw,
         full_years=full_years,
         trend_h=rel_trend(annual_total, full_years), trend_raw=rel_trend(annual_raw, full_years),
+        trend_viirs=trend_viirs, viirs_years=viirs_years, nrt_recent=nrt_recent,
         latest=latest, ly=ly, lm=lm, last_day=last_day, current=current, hist=hist, status=status,
         verdicts=verdicts, year_baseline=year_baseline, arch_cov=arch_cov, arch_full=arch_full,
         alert_days=alert_days, has_frp=has_frp, field_notes=field_notes, monthly_agg=monthly_agg,
@@ -2352,6 +2390,14 @@ with sb.expander("Quality and harmonization"):
         10,
         help="Months below this threshold are skipped when estimating the scaling ratio.",
     )
+    calib_year = st.number_input(
+        "Calibrate MODIS→VIIRS through year",
+        2012,
+        pd.Timestamp.today().year,
+        2019,
+        help="Overlap months after this year are excluded from the scaling fit. "
+        "Terra/Aqua orbit drift in recent years can bias the ratio.",
+    )
 
 # ---- Load the record --------------------------------------------------------
 viirs_key = "snpp" if viirs_mode.startswith("SNPP") else "all"
@@ -2374,7 +2420,7 @@ if match:
         mtime = path.stat().st_mtime
         try:
             hot, info = build_dataset(
-                str(path), mtime, drop_low, veg_only, viirs_key, seasonal_on, int(min_monthly)
+                str(path), mtime, drop_low, veg_only, viirs_key, seasonal_on, int(min_monthly), int(calib_year)
             )
         except Exception as e:
             st.error(f"Could not process {path.name}: {e}")
@@ -2398,7 +2444,7 @@ if match:
                 else:
                     d0, d1 = dmin, dmax
             skey = (str(path), mtime, drop_low, veg_only, viirs_key, seasonal_on,
-                    int(min_monthly), str(d0), str(d1), aoi_wkt)
+                    int(min_monthly), str(d0), str(d1), aoi_wkt, int(calib_year))
             sub = get_sub(*skey)
             if sub.empty:
                 st.warning(
@@ -2427,6 +2473,7 @@ if sub is not None:
     pivot_cov, pivot_full, med_by_month, full = S["pivot_cov"], S["pivot_full"], S["med_by_month"], S["full"]
     annual_by_sensor, annual_total, annual_raw = S["annual_by_sensor"], S["annual_total"], S["annual_raw"]
     full_years, trend_h, trend_raw = S["full_years"], S["trend_h"], S["trend_raw"]
+    trend_viirs, viirs_years, nrt_recent = S["trend_viirs"], S["viirs_years"], S["nrt_recent"]
     latest, ly, lm, last_day = S["latest"], S["ly"], S["lm"], S["last_day"]
     current, hist, status = S["current"], S["hist"], S["status"]
     verdicts, year_baseline = S["verdicts"], S["year_baseline"]
@@ -2920,7 +2967,12 @@ def render_overview():
             ci_txt = f" (range {ci[0]:.2f}–{ci[1]:.2f})" if ci else ""
             st.caption(
                 f"MODIS scaled ×{info['factor']:.2f}{ci_txt} to VIIRS-equivalent from {info['n_valid']} "
-                f"overlap months. {fmt(info['n_final'])} of {fmt(info['n_raw'])} detections kept."
+                f"overlap months (fit through {calib_year}). {fmt(info['n_final'])} of {fmt(info['n_raw'])} detections kept."
+            )
+        if nrt_recent:
+            st.caption(
+                "The tail of this record may be near-real-time (NRT) detections rather than the "
+                "standard reprocessed product, so the most recent weeks carry extra uncertainty."
             )
 
     with right:
@@ -3306,6 +3358,19 @@ if sub is not None:
         show(tidy(ann, "Annual detections, VIIRS-equivalent (partial years included)"), "annual")
         if ci and not scaling.startswith("By"):
             st.caption("Whiskers on the MODIS-derived bars show the bootstrap range of the scaling factor.")
+        trend_bits = []
+        if trend_h is not None:
+            trend_bits.append(f"all complete years {trend_h[0]:+.1f}%/yr")
+        if trend_viirs is not None:
+            trend_bits.append(
+                f"VIIRS era only ({viirs_years[0]}+, {len(viirs_years)} yrs) {trend_viirs[0]:+.1f}%/yr"
+            )
+        if trend_bits:
+            st.caption(
+                "Theil-Sen trend — " + "; ".join(trend_bits) + ". "
+                "The VIIRS-era figure uses only post-splice years, so it does not depend on the "
+                "MODIS scaling factor; a large gap between the two is a red flag for calibration bias."
+            )
 
         by_month_sel = S["monthly_agg"].groupby("month")["detections_viirs_equiv"].sum()
         if cmp_mode == "Same dates, previous year":
@@ -3559,7 +3624,7 @@ if sub is not None:
                 f'<div class="method-item"><b>2. Per-satellite weight</b>'
                 f"<p>Each detection is divided by the active satellite count of its sensor on that date.</p></div>"
                 f'<div class="method-item"><b>3. Cross-calibration</b>'
-                f'<p>From {split:%B %Y}, overlapping months give a median VIIRS / MODIS ratio of ×{info["factor"]:.2f} across the full file.</p></div>'
+                f'<p>From {split:%B %Y}, overlapping months up to {calib_year} give a median VIIRS / MODIS ratio of ×{info["factor"]:.2f} across the full file; later months are excluded to limit orbit-drift bias.</p></div>'
                 f'<div class="method-item"><b>4. Splice</b>'
                 f"<p>Scaled MODIS covers the record before {split:%B %Y}; VIIRS covers {split:%B %Y} onward without double-counting.</p></div>"
                 f"</div>",
@@ -3728,6 +3793,32 @@ if sub is not None:
                 with st.expander("Monthly scaling factors"):
                     st.dataframe(tbl, hide_index=True)
 
+            if aoi_poly is not None:
+                st.caption(
+                    "The scaling factor is fitted on the whole region file, not this drawn area — "
+                    "the true MODIS/VIIRS ratio can differ regionally, so treat scaled values here "
+                    "as approximate."
+                )
+
+        with st.expander("Methods and limitations"):
+            st.markdown(
+                "- **Counts are detections, not area or emissions.** One fire produces many "
+                "detections; FRP is an intensity proxy, not a burned-area measurement.\n"
+                "- **The scaling factor is regional.** It is fitted on the whole country file, "
+                "not each drawn AOI, and can differ between land-cover types.\n"
+                "- **MODIS misses small fires.** Scaling matches monthly totals but cannot "
+                "recover the sub-pixel detail VIIRS sees after 2012.\n"
+                "- **Orbit drift is only partly handled.** Calibration can be capped at a "
+                "chosen year, but Terra/Aqua overpass drift since ~2020 is not fully corrected.\n"
+                "- **Recent data may be NRT.** The tail of a fresh download can be "
+                "near-real-time rather than standard reprocessed quality.\n"
+                "- **Source classes are conservative.** 'Industrial / static' requires a cell "
+                "to recur year-round on many days; everything else stays 'unresolved' because "
+                "FIRMS alone cannot separate field burning from wildfire.\n"
+                "- **Sensor steps are constellation changes,** not fire changes — see the raw "
+                "continuity chart above."
+            )
+
     else:
         key = (match, str(d0), str(d1), drop_low, veg_only, viirs_mode, scaling, int(min_monthly),
                round(path.stat().st_mtime, 1), aoi_key)
@@ -3784,6 +3875,8 @@ if sub is not None:
             report += ["", "## Year by year"] + [f"- {v['year']}: {v['headline']} ({v['short']})" for v in verdicts]
         if trend_h is not None:
             report += ["", f"Annual trend over {len(full_years)} complete years: {trend_h[0]:+.1f}% per year (Theil-Sen)."]
+            if trend_viirs is not None:
+                report += [f"VIIRS-era-only trend ({viirs_years[0]}+): {trend_viirs[0]:+.1f}% per year, independent of the MODIS scaling factor."]
         if not flat.empty:
             report += ["", "## Most active months"] + [
                 f"- {calendar.month_abbr[int(r.month)]} {int(r.year)}: {r.n:,.0f}"

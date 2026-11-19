@@ -29,10 +29,12 @@ def normalize_platform(sat: pd.Series) -> pd.Series:
         plat_per_cat = [
             PLATFORM_MAP.get(str(c).strip().upper(), "UNKNOWN") for c in sat_cats
         ]
-        plat_cats = sorted(set(plat_per_cat))
-        lookup = np.array([plat_cats.index(p) for p in plat_per_cat], dtype=np.int16)
+        plat_cats = sorted(set(plat_per_cat) | {"UNKNOWN"})
+        unknown = plat_cats.index("UNKNOWN")
+        lookup = np.array([plat_cats.index(p) for p in plat_per_cat] or [unknown], dtype=np.int16)
         codes = sat.cat.codes.to_numpy()
-        new_codes = np.where(codes >= 0, lookup[np.clip(codes, 0, None)], -1).astype(np.int16)
+        # Missing satellite values (code -1) are labelled UNKNOWN, not dropped
+        new_codes = np.where(codes >= 0, lookup[np.clip(codes, 0, None)], unknown).astype(np.int16)
         return pd.Series(
             pd.Categorical.from_codes(new_codes, categories=plat_cats),
             index=sat.index,
