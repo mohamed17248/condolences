@@ -47,27 +47,27 @@ NE_PATH = BASE_DIR / "ne_countries.geojson"
 if not NE_PATH.exists():
     NE_PATH = Path("ne_countries.geojson")
 
-MODIS_COLOR = "#5ca4d6"
-VIIRS_COLOR = "#f06428"
-OTHER_COLOR = "#928d82"
-AOI_COLOR = "#4ecdc4"
+MODIS_COLOR = "#22D3EE"
+VIIRS_COLOR = "#A78BFA"
+OTHER_COLOR = "#8f8f8f"
+AOI_COLOR = "#FACC15"
 SAGE_COLOR = "#8fb369"
 DAY_COLOR = "#f2b138"
 NIGHT_COLOR = "#5b8fd9"
 
 FONT_UI = '"Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
-FONT_DISPLAY = '"Fraunces", Georgia, "Times New Roman", serif'
+FONT_DISPLAY = '"Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
 FONT_MONO = '"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace'
 FONT_PLOT = "Plus Jakarta Sans, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
 
 SENSOR_COLORS = {"MODIS": MODIS_COLOR, "VIIRS": VIIRS_COLOR, "UNKNOWN": OTHER_COLOR}
 LEVEL_COLORS = {
-    "much_more": "#f06428",
-    "more": "#e0a938",
-    "typical": "#6892b5",
-    "less": "#8976bd",
-    "much_less": "#6b57a6",
-    "partial": "#585c55",
+    "much_more": "#FF5A1F",
+    "more": "#FFA94D",
+    "typical": "#5B6B7D",
+    "less": "#5E8FD6",
+    "much_less": "#3E64B0",
+    "partial": "#3A424C",
 }
 LEVEL_LABELS = {
     "low": "Below normal",
@@ -1170,7 +1170,7 @@ def tidy(fig, title, height=380):
             y=0.98,
             yanchor="top",
             yref="container",
-            font=dict(size=14, color="#f4f0e6"),
+            font=dict(size=14, color="#e0e0e0"),
         ),
         height=height,
         margin=dict(l=6, r=6, t=82, b=8),
@@ -1183,32 +1183,32 @@ def tidy(fig, title, height=380):
             y=1.0,
             yanchor="bottom",
             title=None,
-            font=dict(size=11, color="#cbc5b9"),
+            font=dict(size=11, color="#b8b8b8"),
         ),
         hoverlabel=dict(
-            bgcolor="#171916",
+            bgcolor="#1e1e1e",
             bordercolor="rgba(244,240,230,0.28)",
-            font=dict(size=12, family=FONT_PLOT, color="#f4f0e6"),
+            font=dict(size=12, family=FONT_PLOT, color="#e0e0e0"),
         ),
-        font=dict(family=FONT_PLOT, size=12, color="#cbc5b9"),
+        font=dict(family=FONT_PLOT, size=12, color="#b8b8b8"),
     )
     fig.update_xaxes(
         showgrid=False,
         automargin=True,
         linecolor="rgba(244,240,230,0.16)",
-        tickfont=dict(color="#928d82"),
+        tickfont=dict(color="#8f8f8f"),
     )
     fig.update_yaxes(
         gridcolor="rgba(244,240,230,0.09)",
         zeroline=False,
         automargin=True,
-        tickfont=dict(color="#928d82"),
+        tickfont=dict(color="#8f8f8f"),
     )
     return fig
 
 
 FIRE_CMAP = colors.LinearSegmentedColormap.from_list(
-    "fire_years", [(0.0, "#6b57a6"), (0.5, "#363b34"), (0.78, "#dc6027"), (1.0, "#ffb469")]
+    "fire_years", [(0.0, "#3E64B0"), (0.5, "#2A3441"), (0.78, "#E8590C"), (1.0, "#FFC078")]
 )
 
 
@@ -1273,10 +1273,10 @@ TILES = {
 MAP_LEGEND_STYLE = (
     "position:fixed;bottom:24px;left:12px;z-index:9999;"
     "background:rgba(12,13,11,0.92);backdrop-filter:blur(6px);"
-    "border:1px solid rgba(244,240,230,0.22);color:#f4f0e6;"
+    "border:1px solid rgba(244,240,230,0.22);color:#e0e0e0;"
     "padding:7px 11px;border-radius:3px;"
     "font:11.5px/1.4 'JetBrains Mono',ui-monospace,monospace;"
-    "box-shadow:0 8px 22px rgba(0,0,0,0.45);"
+    "box-shadow:0 2px 10px rgba(0,0,0,0.35);"
 )
 
 
@@ -1298,7 +1298,7 @@ def base_map(style: str) -> folium.Map:
     # Dark canvas behind tiles on every style: the iframe shows this while
     # Leaflet and tiles are still loading instead of a white flash.
     m.get_root().html.add_child(
-        folium.Element("<style>.leaflet-container{background:#0c0d0b!important}</style>")
+        folium.Element("<style>.leaflet-container{background:#121212!important}</style>")
     )
     if cfg:
         folium.TileLayer(tiles=cfg["tiles"], attr=cfg["attr"], name=style, max_zoom=16,
@@ -1463,7 +1463,7 @@ def add_density(m, sub):
     m.get_root().html.add_child(
         folium.Element(
             f'<div style="{MAP_LEGEND_STYLE}">'
-            f'<div style="color:#928d82;font-size:10px;margin-bottom:4px;">VIIRS-EQ. DENSITY ({cell:g}° CELL)</div>'
+            f'<div style="color:#8f8f8f;font-size:10px;margin-bottom:4px;">VIIRS-EQ. DENSITY ({cell:g}° CELL)</div>'
             f'<div style="display:flex;align-items:center;gap:8px;">'
             f"<span>Low</span>"
             f'<span style="width:92px;height:7px;border-radius:2px;background:{grad};display:inline-block;"></span>'
@@ -1522,7 +1522,7 @@ def add_change(m, sub, recent, base):
     m.get_root().html.add_child(
         folium.Element(
             f'<div style="{MAP_LEGEND_STYLE}">'
-            f'<div style="color:#928d82;font-size:10px;margin-bottom:4px;">ANNUAL CHANGE VS BASELINE</div>'
+            f'<div style="color:#8f8f8f;font-size:10px;margin-bottom:4px;">ANNUAL CHANGE VS BASELINE</div>'
             f'<div style="display:flex;align-items:center;gap:8px;">'
             f"<span>−{lim:,.0f}</span>"
             f'<span style="width:92px;height:7px;border-radius:2px;background:{grad};display:inline-block;"></span>'
@@ -1535,8 +1535,8 @@ def add_change(m, sub, recent, base):
 
 ATTRIBUTION_FIX = (
     "<style>.leaflet-control-attribution{background:rgba(12,13,11,.85)!important;"
-    "color:#928d82!important;font-size:10px;border-top-left-radius:3px}"
-    ".leaflet-control-attribution a{color:#8fb369!important}</style>"
+    "color:#8f8f8f!important;font-size:10px;border-top-left-radius:3px}"
+    ".leaflet-control-attribution a{color:#8f8f8f!important}</style>"
 )
 
 
@@ -1750,18 +1750,21 @@ def analyze(skey, region_text):
 
 PAGE_CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
 
 :root {
-  --bg: #0c0d0b;
-  --sidebar: #111310;
-  --surface: #151714;
-  --surface-2: #1c1f1a;
-  --ink: #f4f0e6;
-  --ink-soft: #cbc5b9;
-  --muted: #928d82;
-  --line: rgba(244, 240, 230, 0.11);
-  --line-strong: rgba(244, 240, 230, 0.26);
+  --bg: #121212;
+  --sidebar: #1a1a1a;
+  --primary: #e0e0e0;
+  --secondary: #b8b8b8;
+  --accent: #e0e0e0;
+  --surface: #1e1e1e;
+  --surface-2: #262626;
+  --ink: #e0e0e0;
+  --ink-soft: #b8b8b8;
+  --muted: #8f8f8f;
+  --line: rgba(224, 224, 224, 0.14);
+  --line-strong: rgba(224, 224, 224, 0.30);
   --sage: #8fb369;
   --ember: #f06428;
   --amber: #e0a938;
@@ -1805,8 +1808,8 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
   padding: .35rem 0 1.15rem 0;
   margin-bottom: 1.25rem;
   background-image:
-    linear-gradient(to right, rgba(244, 240, 230, 0.03) 1px, transparent 1px),
-    linear-gradient(to bottom, rgba(244, 240, 230, 0.03) 1px, transparent 1px);
+    linear-gradient(to right, rgba(224, 224, 224, 0.03) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(224, 224, 224, 0.03) 1px, transparent 1px);
   background-size: 36px 36px;
 }
 .masthead h1 {
@@ -1831,13 +1834,12 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
   flex-wrap: wrap;
   gap: .55rem 1.25rem;
   font-family: __MONO__;
-  font-size: .74rem;
+  font-size: .78rem;
   color: var(--muted);
   padding: .5rem .8rem;
   background: var(--surface);
   border: 1px solid var(--line);
-  border-left: 2px solid var(--ember);
-  border-radius: 3px;
+  border-radius: 6px;
 }
 .telemetry b {
   color: var(--ink);
@@ -1854,7 +1856,7 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
 }
 .sb-label {
   font-family: __MONO__;
-  font-size: .70rem;
+  font-size: .78rem;
   font-weight: 600;
   letter-spacing: .07em;
   text-transform: uppercase;
@@ -1870,11 +1872,12 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
 }
 .aoi-box {
   font-family: __MONO__;
-  font-size: .73rem;
+  font-size: .78rem;
   line-height: 1.5;
   color: var(--ink-soft);
-  border-left: 2px solid #4ecdc4;
-  padding: .2rem 0 .2rem .65rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: .45rem .7rem;
   margin-top: .5rem;
 }
 
@@ -1895,7 +1898,7 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
 }
 [data-testid="stMetricDelta"] {
   font-family: __MONO__;
-  font-size: .74rem;
+  font-size: .78rem;
 }
 [data-testid="stMetricValue"] {
   font-family: __MONO__;
@@ -1913,7 +1916,7 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
   margin-bottom: .75rem;
 }
 .stTabs [data-baseweb="tab"] {
-  padding: .5rem 0;
+  padding: .55rem 0;
   background: transparent;
   color: var(--muted);
   font-size: .91rem;
@@ -1924,13 +1927,32 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
   font-weight: 600;
 }
 .stTabs [data-baseweb="tab-highlight"] {
-  background-color: var(--ember);
+  background-color: var(--accent);
   height: 2px;
+}
+
+/* Secondary accent on pills and sliders */
+[data-testid="stPills"] button[aria-pressed="true"],
+[data-baseweb="pill"][aria-pressed="true"],
+.stPills [aria-pressed="true"] {
+  background: var(--secondary) !important;
+  color: #121212 !important;
+  border-color: var(--secondary) !important;
+}
+[data-baseweb="slider"] [role="slider"],
+.stSlider [role="slider"] {
+  background: var(--secondary) !important;
+  border-color: var(--secondary) !important;
+}
+[data-baseweb="slider"] [data-baseweb="slider-track-fill"],
+.stSlider [class*="trackFill"],
+.stSlider [class*="SliderTrack"] > div {
+  background: var(--secondary) !important;
 }
 
 /* Verdict statement */
 .verdict {
-  border-left: 3px solid var(--slate);
+  border-left: 1px solid var(--line-strong);
   padding: .15rem 0 .2rem .95rem;
   margin: .35rem 0 1rem 0;
   animation: fadeSlide .35s ease-out;
@@ -1944,7 +1966,7 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
 }
 .verdict-meta {
   font-family: __MONO__;
-  font-size: .72rem;
+  font-size: .78rem;
   color: var(--muted);
   margin-bottom: .25rem;
 }
@@ -1978,27 +2000,24 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
 .notes-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 10px;
+  gap: 1.5rem;
   margin: .45rem 0 1.15rem 0;
 }
 .fnote {
   background: var(--surface);
   border: 1px solid var(--line);
-  border-left: 3px solid var(--sage);
-  border-radius: 3px;
+  border-radius: 6px;
   padding: .68rem .85rem .72rem;
   transition: background-color .14s;
 }
-.fnote:hover {
-  background: var(--surface-2);
-}
+
 .fnote.regime {border-left-color: var(--ember);}
 .fnote.clock {border-left-color: var(--amber);}
 .fnote.record {border-left-color: var(--slate);}
 .fnote.orbital {border-left-color: var(--sage);}
 .fnote-tag {
   font-family: __MONO__;
-  font-size: .68rem;
+  font-size: .78rem;
   font-weight: 600;
   letter-spacing: .05em;
   text-transform: uppercase;
@@ -2008,7 +2027,7 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
 .fnote.regime .fnote-tag {color: #f48656;}
 .fnote.clock .fnote-tag {color: #ecc063;}
 .fnote.record .fnote-tag {color: #8cb4d4;}
-.fnote.orbital .fnote-tag {color: #a8c786;}
+.fnote.orbital .fnote-tag {color: #8f8f8f;}
 .fnote-head {
   font-size: .92rem;
   font-weight: 600;
@@ -2049,7 +2068,7 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
   align-items: center;
   gap: 6px;
   font-family: __MONO__;
-  font-size: .70rem;
+  font-size: .78rem;
   color: var(--muted);
 }
 .stripes-swatches {
@@ -2069,7 +2088,7 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
   padding: 2px;
   background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 3px;
+  border-radius: 6px;
   margin: 0 0 .25rem 0;
 }
 .stripe {
@@ -2091,7 +2110,7 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
   justify-content: space-between;
   font-family: __MONO__;
   color: var(--muted);
-  font-size: .73rem;
+  font-size: .78rem;
   margin-bottom: .35rem;
 }
 
@@ -2099,7 +2118,7 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
 .yeargrid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
-  gap: 8px;
+  gap: 1rem;
   margin: 1.1rem 0 .5rem 0;
 }
 .yearcard {
@@ -2107,19 +2126,15 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
   flex-direction: column;
   justify-content: space-between;
   border: 1px solid var(--line);
-  border-top: 3px solid var(--line);
   background: var(--surface);
   padding: .62rem .75rem .68rem;
-  border-radius: 3px;
+  border-radius: 6px;
   transition: background-color .14s;
 }
-.yearcard:hover {
-  background: var(--surface-2);
-}
+
 .yearcard.active {
   background: var(--surface-2);
   border-color: var(--line-strong);
-  box-shadow: inset 0 0 0 1px rgba(244, 240, 230, 0.24);
 }
 .yearcard .y {
   font-family: __MONO__;
@@ -2136,7 +2151,7 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
 }
 .yearcard .s {
   font-family: __MONO__;
-  font-size: .72rem;
+  font-size: .78rem;
   color: var(--muted);
   margin-top: .42rem;
   padding-top: .32rem;
@@ -2163,12 +2178,12 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
 }
 .ribbon-cell {
   height: 2.3rem;
-  border-radius: 2px;
+  border-radius: 4px;
   padding: .22rem .4rem;
   display: flex;
   align-items: flex-end;
   font-family: __MONO__;
-  font-size: .71rem;
+  font-size: .78rem;
   font-weight: 500;
   border: 1px solid rgba(255, 255, 255, 0.05);
 }
@@ -2177,7 +2192,7 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
 .method-list {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-  gap: 14px;
+  gap: 1.5rem;
   border-top: 1px solid var(--line);
   border-bottom: 1px solid var(--line);
   padding: .9rem 0;
@@ -2212,7 +2227,7 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
 }
 .region-head .span {
   font-family: __MONO__;
-  font-size: .74rem;
+  font-size: .78rem;
   color: var(--muted);
 }
 
@@ -2253,8 +2268,8 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #0c0d0b;
-  color: #928d82;
+  background: #121212;
+  color: #8f8f8f;
   font-size: .82rem;
   letter-spacing: .12em;
   text-transform: uppercase;
@@ -2263,19 +2278,19 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
   position: relative;
   z-index: 1;
   border: 1px solid var(--line);
-  border-radius: 3px;
-  background: #0c0d0b;
+  border-radius: 6px;
+  background: #121212;
 }
 .stDownloadButton button, .stButton button {
-  border-radius: 3px;
+  border-radius: 6px;
   border: 1px solid var(--line-strong);
   background-color: var(--surface);
   color: var(--ink);
   font-size: .85rem;
 }
 .stDownloadButton button:hover, .stButton button:hover {
-  border-color: var(--ember);
-  color: var(--ember);
+  border-color: var(--accent);
+  color: var(--accent);
 }
 </style>
 """
@@ -2594,7 +2609,7 @@ def render_map(msub, tag="all", height=640):
             highlight_function=lambda f: {
                 "fillColor": "#f06428",
                 "fillOpacity": 0.45,
-                "color": "#f4f0e6",
+                "color": "#e0e0e0",
                 "weight": 2.2,
             },
             tooltip=folium.GeoJsonTooltip(
@@ -2645,7 +2660,7 @@ def render_map(msub, tag="all", height=640):
         folium.GeoJson(
             mapping(country_geom),
             style_function=lambda f: {
-                "color": "#cbc5b9",
+                "color": "#b8b8b8",
                 "weight": 1.2,
                 "opacity": 0.42,
                 "fillOpacity": 0.0,
@@ -2790,7 +2805,7 @@ def render_predict(sub, style, match, bbox, aoi_poly, region_text, skey):
             chart_df, x="viirs_eq", y="cls", orientation="h",
             labels=dict(viirs_eq="VIIRS-equivalent detections", cls="", detections="Raw detections"),
             color="cls",
-            color_discrete_map={c: SRC_COLORS.get(c, "#8a857c") for c in order},
+            color_discrete_map={c: SRC_COLORS.get(c, "#8f8f8f") for c in order},
             hover_data={"detections": True, "viirs_eq": ":.0f"},
         )
         fig.update_layout(height=max(220, 34 * len(order)), showlegend=False, margin=dict(l=8, r=8, t=8, b=8))
@@ -2841,7 +2856,7 @@ def render_predict(sub, style, match, bbox, aoi_poly, region_text, skey):
                    f"Projected reach: {rate * horizon:g} km"),
         ).add_to(m)
         folium.CircleMarker(
-            location=[r["la"], r["lo"]], radius=4, color="#f4f0e6", weight=1,
+            location=[r["la"], r["lo"]], radius=4, color="#e0e0e0", weight=1,
             fill=True, fill_color=col, fill_opacity=0.95,
             tooltip=f"{int(r['n']):,} recent detections",
         ).add_to(m)
@@ -2885,9 +2900,10 @@ def render_overview():
     )
 
     # Field notes derived from the live region/AOI data
-    render_field_notes(field_notes)
+    with st.expander("Field notes", expanded=True):
+        render_field_notes(field_notes)
 
-    left, right = st.columns([4, 8], gap="large")
+    right, left = st.columns([8, 4], gap="large")
 
     with left:
         st.markdown(
@@ -2919,16 +2935,11 @@ def render_overview():
             help="Individual detections kept after quality filters and the MODIS/VIIRS splice.",
         )
         b.metric(
-            "Harmonized total",
-            fmt(S["w_sum"]),
-            help="VIIRS-equivalent detections: per-satellite normalized, MODIS scaled.",
-        )
-        c, d = st.columns(2)
-        c.metric(
             "Peak month",
             calendar.month_name[int(med_by_month.idxmax())] if med_by_month.notna().any() else "n/a",
             help="Calendar month with the highest median across complete months.",
         )
+        c, d = st.columns(2)
         label = f"{calendar.month_abbr[lm]} {ly}, days 1–{last_day}"
         if status is not None:
             d.metric(
@@ -2940,17 +2951,20 @@ def render_overview():
             )
         else:
             d.metric(label, fmt(current))
-        e, g = st.columns(2)
         if trend_h is not None:
-            e.metric(
+            st.metric(
                 "Annual trend",
                 f"{trend_h[0]:+.1f}% / yr",
                 help=f"Theil-Sen slope over {len(full_years)} complete years, relative to the median year.",
             )
         else:
-            e.metric("Annual trend", "n/a", help="Needs at least five complete years in the selected range.")
-        g.metric("Latest data", f"{dmax:%d %b %Y}")
+            st.metric("Annual trend", "n/a", help="Needs at least five complete years in the selected range.")
 
+        with st.expander("More numbers", expanded=False):
+            m1, m2 = st.columns(2)
+            m1.metric("Harmonized total", fmt(S["w_sum"]),
+                      help="VIIRS-equivalent detections: per-satellite normalized, MODIS scaled.")
+            m2.metric("Latest data", f"{dmax:%d %b %Y}")
         if has_frp and S["frp_sum"] > 0:
             fr1, fr2 = st.columns(2)
             fr1.metric(
@@ -2973,8 +2987,8 @@ def render_overview():
             for mo in range(1, 13):
                 v = med_by_month.get(mo, np.nan)
                 frac = 0.0 if pd.isna(v) else float(v) / top
-                ring = "box-shadow: inset 0 0 0 2px #8fb369;" if mo == lm else ""
-                ink = "#0c0d0b" if frac > 0.56 else "#f4f0e6"
+                ring = "box-shadow: inset 0 0 0 2px #e0e0e0;" if mo == lm else ""
+                ink = "#121212" if frac > 0.56 else "#e0e0e0"
                 tip = f"{calendar.month_name[mo]}: median {fmt(0 if pd.isna(v) else v)} detections"
                 cells.append(
                     f'<div class="ribbon-cell" title="{tip}" style="background: rgba(240,100,40,{0.08 + 0.88 * frac:.2f});'
@@ -3077,24 +3091,48 @@ def month_row(piv, y):
 if sub is not None:
     # Section nav: only the active section's body executes on each rerun,
     # which keeps the heavy tabs (timelapse, predict) from slowing every click.
-    _nav_labels = ["Overview", "Year by year", "Calendar & clock", "Trends & pacing",
-                   "Timelapse", "Recent activity & sources", "Harmonization", "Data"]
-    _nav_keys = ["overview", "year", "cal", "trend", "time", "pred", "harm", "data"]
+    _key_of = {"Overview": "overview", "Year by year": "year",
+               "Calendar & clock": "cal", "Trends & pacing": "trend",
+               "Timelapse": "time", "Recent activity & sources": "pred",
+               "Harmonization": "harm", "Data": "data"}
+    _label_of = {v: k for k, v in _key_of.items()}
+    _nav_labels = ["Overview", "Year by year", "Patterns", "Timelapse", "Method & data"]
+    _sub_map = {"Patterns": ["Calendar & clock", "Trends & pacing"],
+                "Method & data": ["Recent activity & sources", "Harmonization", "Data"]}
     _qp = st.query_params.get("tab", "overview")
-    _nav_i = _nav_keys.index(_qp) if _qp in _nav_keys else 0
-    st.session_state.setdefault("section_nav", _nav_labels[_nav_i])
+    _start = _label_of.get(_qp, "Overview")
+    _parent = next((p for p, subs in _sub_map.items() if _start in subs), _start)
+    _nav_i = _nav_labels.index(_parent)
+    st.session_state.setdefault("section_nav", _parent)
+    _top = None
     if hasattr(st, "pills"):
-        _sel = st.pills("Section", _nav_labels, selection_mode="single",
+        _top = st.pills("Section", _nav_labels, selection_mode="single",
                         key="section_nav", label_visibility="collapsed")
-        if isinstance(_sel, (list, tuple)):
-            _sel = _sel[0] if _sel else _nav_labels[_nav_i]
+        if isinstance(_top, (list, tuple)):
+            _top = _top[0] if _top else _nav_labels[_nav_i]
     else:
-        _sel = st.radio("Section", _nav_labels,
-                        index=_nav_labels.index(st.session_state["section_nav"])
-                        if st.session_state["section_nav"] in _nav_labels else _nav_i,
+        _top = st.radio("Section", _nav_labels,
+                        index=_nav_labels.index(_nav_i),
                         horizontal=True, label_visibility="collapsed", key="section_nav")
-    _sel = _sel if _sel in _nav_labels else "Overview"
-    _tab_key = _nav_keys[_nav_labels.index(_sel)]
+    _nav_pick = _top if _top in _nav_labels else _nav_labels[_nav_i]
+    if _nav_pick in _sub_map:
+        _subs = _sub_map[_nav_pick]
+        _cur = st.session_state.get("sub_" + _nav_pick, _subs[0])
+        _cur = _cur if _cur in _subs else _subs[0]
+        _pk = st.pills(" ", _subs, selection_mode="single", key="sub_" + _nav_pick,
+                       label_visibility="collapsed")
+        if isinstance(_pk, str):
+            _sel = _pk
+        elif isinstance(_pk, (list, tuple)) and _pk:
+            _sel = _pk[0]
+        else:
+            _sel = _cur
+    else:
+        _sel = _nav_pick
+    _VALID = set(_key_of) | {"Patterns", "Method & data"}
+    if _sel not in _VALID:
+        _sel = "Overview"
+    _tab_key = _key_of.get(_sel, "overview")
     if st.query_params.get("tab") != _tab_key:
         st.query_params["tab"] = _tab_key
 
@@ -3233,8 +3271,8 @@ if sub is not None:
             )
             heat.update_traces(texttemplate="%{z:+.0f}%", textfont_size=9)
             heat_title = f"Deviation from each calendar month's median, {region_text}"
-        heat.update_yaxes(type="category", automargin=True, tickfont=dict(color="#928d82"))
-        heat.update_xaxes(automargin=True, tickfont=dict(color="#928d82"))
+        heat.update_yaxes(type="category", automargin=True, tickfont=dict(color="#8f8f8f"))
+        heat.update_xaxes(automargin=True, tickfont=dict(color="#8f8f8f"))
         heat.update_layout(
             height=max(300, 30 * len(pivot_cov) + 140),
             margin=dict(l=6, r=6, t=56, b=8),
@@ -3247,15 +3285,15 @@ if sub is not None:
                 y=0.98,
                 yanchor="top",
                 yref="container",
-                font=dict(size=14, color="#f4f0e6"),
+                font=dict(size=14, color="#e0e0e0"),
             ),
-            coloraxis_colorbar=dict(title=None, thickness=12, len=0.9, tickfont=dict(color="#928d82")),
+            coloraxis_colorbar=dict(title=None, thickness=12, len=0.9, tickfont=dict(color="#8f8f8f")),
             hoverlabel=dict(
-                bgcolor="#171916",
+                bgcolor="#1e1e1e",
                 bordercolor="rgba(244,240,230,0.28)",
-                font=dict(size=12, family=FONT_PLOT, color="#f4f0e6"),
+                font=dict(size=12, family=FONT_PLOT, color="#e0e0e0"),
             ),
-            font=dict(family=FONT_PLOT, size=12, color="#cbc5b9"),
+            font=dict(family=FONT_PLOT, size=12, color="#b8b8b8"),
         )
         show(heat, "calendar")
         st.caption(
@@ -3547,7 +3585,7 @@ if sub is not None:
                         x=[xs_spot[-1]],
                         y=[ys_spot[-1]],
                         mode="markers",
-                        marker=dict(color=VIIRS_COLOR, size=8, line=dict(color="#0c0d0b", width=1.5)),
+                        marker=dict(color=VIIRS_COLOR, size=8, line=dict(color="#121212", width=1.5)),
                         showlegend=False,
                         hoverinfo="skip",
                     )
@@ -3620,15 +3658,15 @@ if sub is not None:
                 height=640,
                 margin=dict(l=0, r=0, t=0, b=0),
                 paper_bgcolor="rgba(0,0,0,0)",
-                font=dict(family=FONT_PLOT, color="#cbc5b9"),
-                coloraxis_colorbar=dict(title="Detections / cell", thickness=12, tickfont=dict(color="#928d82")),
+                font=dict(family=FONT_PLOT, color="#b8b8b8"),
+                coloraxis_colorbar=dict(title="Detections / cell", thickness=12, tickfont=dict(color="#8f8f8f")),
             )
             st.caption(
                 "Press play to watch the burning season by season. Each frame is one year of "
                 f"VIIRS-equivalent detections on a grid of about {cell_t:g}°. "
                 "The colour scale is locked across every frame so years can be compared directly."
             )
-            show(fig_t, "timelapse")
+            show(fig_t, f"timelapse-{match}-{aoi_key}")
         except Exception as exc:
             st.info(f"The timelapse could not be drawn here ({exc}). Update plotly to 5.24 or newer and try again.")
 
@@ -3761,7 +3799,7 @@ if sub is not None:
                     y=annual_total.to_numpy(),
                     mode="lines+markers",
                     name="Harmonized",
-                    line=dict(color="#f4f0e6", width=2.8),
+                    line=dict(color="#e0e0e0", width=2.8),
                     marker=dict(size=6),
                 )
                 cmp_.update_xaxes(dtick=2)
@@ -3799,7 +3837,7 @@ if sub is not None:
                             name=nm, line=dict(color=clr, width=1.8),
                         )
                 if info["split"] is not None:
-                    seam.add_vline(x=info["split"], line_dash="dash", line_color="#f4f0e6")
+                    seam.add_vline(x=info["split"], line_dash="dash", line_color="#e0e0e0")
                 seam.update_xaxes(title="Month")
                 seam.update_yaxes(title="Raw detections / month")
                 show(tidy(seam, "Sensor continuity: raw monthly detections across the whole record", 340), "seam")
@@ -3942,6 +3980,22 @@ if sub is not None:
         st.dataframe(mt, hide_index=True)
 
 else:
+    if match is None:
+        st.markdown(
+            '<div class="masthead"><div class="region-head">'
+            '<span class="title">The Burn Record</span>'
+            '<span class="span">MODIS + VIIRS fire activity, 2000–present</span></div>'
+            '<p class="lede" style="margin:.4rem 0 1rem">Pick a country on the map, or jump straight in:</p></div>',
+            unsafe_allow_html=True,
+        )
+        _all_loaded = [k for k in regions if has_data(k) and k not in ALIASES]
+        _quick = list(np.random.permutation(_all_loaded))[:6] if _all_loaded else []
+        if _quick:
+            _qc = st.columns(len(_quick))
+            for _i, _k in enumerate(_quick):
+                if _qc[_i].button(_k.title(), key=f"quick_{_k}"):
+                    st.session_state["_pending_region"] = _k
+                    st.rerun()
     render_map(None, height=540)
     if match is None:
         loaded_keys = sorted(k for k in regions if has_data(k) and k not in ALIASES)
