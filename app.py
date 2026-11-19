@@ -2765,6 +2765,154 @@ def render_field_notes(notes):
     st.markdown(f'<div class="notes-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
 
 
+def _country_static_map(key, canon):
+    """Non-interactive geopandas map + summary stats for one country."""
+    import io
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    path = find_data_file(key, canon)
+    if path is None or key not in geoms_wkb:
+        return None, None
+    if path.suffix == ".parquet":
+        df = pd.read_parquet(path)
+    else:
+        df = pd.read_csv(path, usecols=lambda c: c.strip().lower() in
+                         {"latitude", "longitude", "acq_date", "satellite", "instrument"})
+    df.columns = [c.strip().lower() for c in df.columns]
+    df = df.dropna(subset=["latitude", "longitude", "acq_date"])
+    if df.empty:
+        return None, None
+    df["acq_date"] = pd.to_datetime(df["acq_date"], errors="coerce")
+    df = df.dropna(subset=["acq_date"])
+
+    # stats on the full record
+    yrs = df["acq_date"].dt.year
+    counts = yrs.value_counts().sort_index()
+    full_years = [y for y in counts.index if counts.loc[y] > 0]
+    slope = icpt = None
+    if len(counts) >= 5:
+        slope, icpt = theil_sen(counts.index.to_numpy(float), counts.to_numpy(float))
+        med = float(np.median(counts.to_numpy(float)))
+        trend_pct = slope / med * 100 if med > 0 else None
+    else:
+        trend_pct = None
+    peak_m = int(df["acq_date"].dt.month.value_counts().idxmax())
+    stats = dict(
+        country=key.replace("_", " ").title(),
+        detections=len(df),
+        years=f"{int(yrs.min())}–{int(yrs.max())}",
+        peak_month=calendar.month_name[peak_m],
+        trend=(f"{trend_pct:+.1f}%/yr" if trend_pct is not None else "n/a"),
+    )
+    monthly = df.groupby(df["acq_date"].dt.month).size().reindex(range(1, 13), fill_value=0)
+    annual = counts
+
+    # map on a sample
+    plot_df = df.sample(min(len(df), 40000), random_state=0) if len(df) > 40000 else df
+    plat = normalize_platform(plot_df["satellite"]) if "satellite" in plot_df else pd.Series("UNKNOWN", index=plot_df.index)
+    sensor = infer_sensor(plot_df, plat)
+    sensor_name = np.asarray(sensor.astype(str))
+
+    geom = shape(shapely.from_wkb(geoms_wkb[key]))
+    boundary = gpd.GeoSeries([geom], crs="EPSG:4326")
+
+    fig, ax = plt.subplots(figsize=(6.4, 5.4))
+    fig.patch.set_facecolor("#121212")
+    ax.set_facecolor("#121212")
+    boundary.plot(ax=ax, color="#262626", edgecolor="#8f8f8f", linewidth=0.8, zorder=1)
+    la = plot_df["latitude"].to_numpy(float)
+    lo = plot_df["longitude"].to_numpy(float)
+    for sname, col in (("MODIS", "#22D3EE"), ("VIIRS", "#A78BFA")):
+        m = sensor_name == sname
+        if m.any():
+            ax.scatter(lo[m], la[m], s=1.6, c=col, alpha=0.45, zorder=2, linewidths=0)
+    ax.set_title(stats["country"], color="#e0e0e0", fontsize=13, pad=10)
+    ax.set_xticks([]); ax.set_yticks([])
+    for sp in ax.spines.values():
+        sp.set_visible(False)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=140, bbox_inches="tight", facecolor="#121212")
+    plt.close(fig)
+    return buf.getvalue(), stats, monthly, annual
+
+
+def render_compare():
+    st.markdown(
+        '<p class="lede">Pick two countries with loaded archives to compare their fire record. '
+        "Static geopandas maps (not interactive) sit side by side with headline stats.</p>",
+        unsafe_allow_html=True,
+    )
+    opts = sorted(k for k in regions if has_data(k) and k not in ALIASES and k in geoms_wkb)
+    if len(opts) < 2:
+        st.info("At least two country archives are needed for comparison.")
+        return
+    c1, c2 = st.columns(2)
+    a = c1.selectbox("Country A", opts, key="cmp_a")
+    b = c2.selectbox("Country B", opts, index=min(1, len(opts) - 1), key="cmp_b")
+    if a == b:
+        st.warning("Pick two different countries.")
+        return
+    maps, stats, monthly_a, annual_a = {}, {}, {}, {}
+    with st.spinner("Rendering static maps…"):
+        for k in (a, b):
+            png, stt, mo, an = _country_static_map(k, canon)
+            maps[k], stats[k], monthly_a[k], annual_a[k] = png, stt, mo, an
+    cols = st.columns(2)
+    for k, col in zip((a, b), cols):
+        with col:
+            if maps[k]:
+                st.image(maps[k], width="stretch")
+            if stats[k]:
+                st.markdown(
+                    f"**{stats[k]['country']}** — {stats[k]['detections']:,} detections · "
+                    f"{stats[k]['years']} · peak {stats[k]['peak_month']} · trend {stats[k]['trend']}"
+                )
+    if all(stats.values()):
+        st.dataframe(pd.DataFrame([stats[a], stats[b]]), hide_index=True)
+
+    if all(monthly_a.get(k) is not None for k in (a, b)):
+        mn = [calendar.month_abbr[m] for m in range(1, 13)]
+        fig_m = go.Figure()
+        for k, col in ((a, "#22D3EE"), (b, "#A78BFA")):
+            fig_m.add_trace(go.Scatter(
+                x=mn, y=monthly_a[k].to_numpy(float), mode="lines", name=stats[k]["country"],
+                line=dict(color=col, width=2),
+            ))
+        fig_m.update_layout(
+            title="Detections by calendar month", height=340, template="plotly_dark",
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(family=FONT_PLOT, color="#b8b8b8", size=12),
+            legend=dict(orientation="h", y=1.12, font=dict(color="#b8b8b8")),
+            margin=dict(l=8, r=8, t=60, b=8),
+        )
+        fig_m.update_yaxes(gridcolor="rgba(224,224,224,0.08)", zeroline=False)
+        fig_m.update_xaxes(gridcolor="rgba(224,224,224,0.05)")
+        show(fig_m, f"cmp-month-{a}-{b}")
+
+    if all(annual_a.get(k) is not None for k in (a, b)):
+        yrs = sorted(set(annual_a[a].index) | set(annual_a[b].index))
+        fig_y = go.Figure()
+        for k, col in ((a, "#22D3EE"), (b, "#A78BFA")):
+            fig_y.add_trace(go.Bar(
+                x=yrs, y=[float(annual_a[k].get(y, 0)) for y in yrs],
+                name=stats[k]["country"], marker_color=col, opacity=0.75,
+            ))
+        fig_y.update_layout(
+            title="Detections per year", height=340, template="plotly_dark", barmode="group",
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(family=FONT_PLOT, color="#b8b8b8", size=12),
+            legend=dict(orientation="h", y=1.12, font=dict(color="#b8b8b8")),
+            margin=dict(l=8, r=8, t=60, b=8),
+        )
+        fig_y.update_yaxes(gridcolor="rgba(224,224,224,0.08)", zeroline=False)
+        fig_y.update_xaxes(gridcolor="rgba(224,224,224,0.05)", tickangle=-45)
+        show(fig_y, f"cmp-year-{a}-{b}")
+
+
 def render_predict(sub, style, match, bbox, aoi_poly, region_text, skey):
     st.markdown(
         f'<p class="lede">Two tools that look at recent and unusual activity: a conservative '
@@ -3093,10 +3241,10 @@ if sub is not None:
     # which keeps the heavy tabs (timelapse, predict) from slowing every click.
     _key_of = {"Overview": "overview", "Year by year": "year",
                "Calendar & clock": "cal", "Trends & pacing": "trend",
-               "Timelapse": "time", "Recent activity & sources": "pred",
+               "Timelapse": "time", "Compare": "compare", "Recent activity & sources": "pred",
                "Harmonization": "harm", "Data": "data"}
     _label_of = {v: k for k, v in _key_of.items()}
-    _nav_labels = ["Overview", "Year by year", "Patterns", "Timelapse", "Method & data"]
+    _nav_labels = ["Overview", "Year by year", "Patterns", "Timelapse", "Compare", "Method & data"]
     _sub_map = {"Patterns": ["Calendar & clock", "Trends & pacing"],
                 "Method & data": ["Recent activity & sources", "Harmonization", "Data"]}
     _qp = st.query_params.get("tab", "overview")
@@ -3669,6 +3817,9 @@ if sub is not None:
             show(fig_t, f"timelapse-{match}-{aoi_key}")
         except Exception as exc:
             st.info(f"The timelapse could not be drawn here ({exc}). Update plotly to 5.24 or newer and try again.")
+
+    elif _sel == "Compare":
+        render_compare()
 
     elif _sel == "Recent activity & sources":
         render_predict(sub, style, match, bbox, aoi_poly, region_text, skey)
