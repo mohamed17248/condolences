@@ -661,7 +661,7 @@ def short_text(ratio):
     return f"{ratio:.1f}× usual" if ratio >= 2 else f"{(ratio - 1) * 100:+.0f}% vs usual"
 
 
-def _month_masks(pivot, lo, hi, tol=pd.Timedelta(days=3)):
+def _month_masks(pivot, lo, hi, tol=pd.Timedelta(3, unit="D")):
     """Which year/month cells are touched by, and fully inside, a date range."""
     covered = pd.DataFrame(False, index=pivot.index, columns=pivot.columns)
     full = covered.copy()
@@ -1720,7 +1720,7 @@ def analyze(skey, region_text):
     viirs_years = [y for y in full_years if first_clean is not None and y >= first_clean]
     trend_viirs = rel_trend(annual_total, viirs_years)
     dmax_dt = sub["acq_date"].max()
-    nrt_recent = bool((pd.Timestamp.today().normalize() - dmax_dt) < pd.Timedelta(days=120))
+    nrt_recent = bool((pd.Timestamp.today().normalize() - dmax_dt) < pd.Timedelta(120, unit="D"))
 
     monthly_agg = (
         sub.groupby(["year", "month"])
@@ -2780,7 +2780,7 @@ def render_predict(sub, style, match, bbox, aoi_poly, region_text, skey):
     horizon = p3.select_slider("Project ahead (days)", options=[1, 3, 7, 14], value=7,
                                key="spread_horizon", format_func=lambda d: f"{d} d")
 
-    cutoff = sub["acq_date"].max() - pd.Timedelta(days=window)
+    cutoff = sub["acq_date"].max() - pd.Timedelta(window, unit="D")
     src = sub[sub["acq_date"] >= cutoff]
     st.caption(
         f"Using {fmt(len(src))} detections ending {sub['acq_date'].max():%d %b %Y} "
