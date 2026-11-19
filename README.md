@@ -27,7 +27,7 @@ Required columns: `latitude`, `longitude`, `acq_date`. Used when present: `satel
 (~4.5 GB) are published as release assets. After cloning:
 
 ```
-python fetch_world_data.py "https://github.com/mohamed17248/nasa-space-app-mohamed-abbas/releases/download/world-data-v1"
+python fetch_world_data.py "https://github.com/mohamed17248/condolences/releases/download/world-data-v1"
 ```
 
 This downloads and extracts the `volume_*.zip` assets into `data/`. For a quick
@@ -35,7 +35,7 @@ subset (~160 MB — Greece, Portugal, Spain, Italy, France, Türkiye, South Afri
 Kenya, Chile, Indonesia), add `--lite`:
 
 ```
-python fetch_world_data.py "https://github.com/mohamed17248/nasa-space-app-mohamed-abbas/releases/download/world-data-v1" --lite
+python fetch_world_data.py "https://github.com/mohamed17248/condolences/releases/download/world-data-v1" --lite
 ```
 
 **Option B — build your own from FIRMS.** Download country/year CSVs from
