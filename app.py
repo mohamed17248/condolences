@@ -1295,13 +1295,14 @@ def base_map(style: str) -> folium.Map:
         max_bounds_viscosity=0.5,
     )
     cfg = TILES[style]
+    # Dark canvas behind tiles on every style: the iframe shows this while
+    # Leaflet and tiles are still loading instead of a white flash.
+    m.get_root().html.add_child(
+        folium.Element("<style>.leaflet-container{background:#0c0d0b!important}</style>")
+    )
     if cfg:
         folium.TileLayer(tiles=cfg["tiles"], attr=cfg["attr"], name=style, max_zoom=16,
                          no_wrap=True).add_to(m)
-    else:
-        m.get_root().html.add_child(
-            folium.Element("<style>.leaflet-container{background:#0c0d0b!important}</style>")
-        )
     return m
 
 
@@ -2243,6 +2244,7 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
 [data-testid="stCustomComponentV1"] iframe {
   border: 1px solid var(--line);
   border-radius: 3px;
+  background: #0c0d0b;
 }
 .stDownloadButton button, .stButton button {
   border-radius: 3px;
@@ -2697,8 +2699,12 @@ def render_map(msub, tag="all", height=640):
                     # smallest polygon for overlapping boundaries.
                     with_data = [h for h in hits if has_data(h[1])]
                     pool = with_data or hits
-                    st.session_state["_pending_region"] = min(pool)[1]
-                    st.rerun()
+                    picked = min(pool)[1]
+                    # Re-clicking the country already open would just remount
+                    # the map — skip the rerun entirely.
+                    if picked != match:
+                        st.session_state["_pending_region"] = picked
+                        st.rerun()
 
     if draw_mode and data_ready and result and result.get("all_drawings"):
         poly = drawing_to_polygon(result["all_drawings"][-1])
