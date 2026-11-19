@@ -2241,7 +2241,27 @@ footer, #MainMenu, [data-testid="stAppDeployButton"] {
   line-height: 1.6;
 }
 
+[data-testid="stCustomComponentV1"] > div {
+  position: relative;
+  min-height: 560px;
+}
+[data-testid="stCustomComponentV1"] > div::after {
+  content: "Loading map…";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #0c0d0b;
+  color: #928d82;
+  font-size: .82rem;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
 [data-testid="stCustomComponentV1"] iframe {
+  position: relative;
+  z-index: 1;
   border: 1px solid var(--line);
   border-radius: 3px;
   background: #0c0d0b;
