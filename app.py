@@ -4140,7 +4140,16 @@ else:
             unsafe_allow_html=True,
         )
         _all_loaded = [k for k in regions if has_data(k) and k not in ALIASES]
-        _quick = list(np.random.permutation(_all_loaded))[:6] if _all_loaded else []
+        # Shuffle once per session: reshuffling every rerun moves buttons
+        # between columns, which breaks Streamlit widget identity and makes
+        # clicks land on the wrong (dead) button.
+        if "_quick_picks" not in st.session_state:
+            st.session_state["_quick_picks"] = (
+                [str(k) for k in np.random.permutation(_all_loaded)[:6]]
+                if _all_loaded
+                else []
+            )
+        _quick = [k for k in st.session_state["_quick_picks"] if k in _all_loaded]
         if _quick:
             _qc = st.columns(len(_quick))
             for _i, _k in enumerate(_quick):
