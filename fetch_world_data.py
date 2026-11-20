@@ -38,7 +38,7 @@ def _req(url, headers=None):
 
 
 def _open(url, headers=None):
-    return urllib.request.urlopen(_req(url, headers), timeout=60)
+    return urllib.request.urlopen(_req(url, headers), timeout=600)
 
 
 def probe_size(url):
