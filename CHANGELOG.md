@@ -108,7 +108,7 @@ Tab name. “Predict & sources” is now “Recent activity & sources”.
 A bug in the alert-days table. Every date showed 2021. It now shows the real year, for example “05 Apr 2011”.
 
 
-## new features added and fixed
+## new features added and fixes
 
 Daily burning calendar (Patterns > Calendar & clock). One cell per day for a chosen year, weeks across and weekdays down. Blank cells mean "outside the loaded record", never zero fire. The colour scale is capped at the 98th percentile so one extreme day does not wash out the season.
 "How to read this page" panel on the Overview, explaining the stripes, the verdict, the map, harmonization and the downloads.
