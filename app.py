@@ -1,7 +1,7 @@
 """
 
 The Burn Record
-Made by Ahmed Sultan, Mohamed Abbas, Eyad Elbana and Mohamed Zaghloul
+Made by Ahmed sultan & Mohamed abbas (queriesonhold/egobreaking & mohamed17248)
 Run:    streamlit run app.py
 Data:   FIRMS archive downloads (https://firms.modaps.eosdis.nasa.gov/download/)
         saved in ./data/<country>.csv or ./data/<country>.parquet
