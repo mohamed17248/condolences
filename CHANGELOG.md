@@ -105,6 +105,18 @@ Memory. The unusual-days check no longer copies every column.
 Region selector. index=None is back on the region selectbox.
 Rating threshold. It is now four complete years everywhere, in one constant.
 Tab name. “Predict & sources” is now “Recent activity & sources”.
-A bug in the alert-days table. Every date showed 2021. It now shows the real year, for example “05 Apr 2010”.
+A bug in the alert-days table. Every date showed 2021. It now shows the real year, for example “05 Apr 2011”.
+
+
+## new features added and fixed
+
+Daily burning calendar (Patterns > Calendar & clock). One cell per day for a chosen year, weeks across and weekdays down. Blank cells mean "outside the loaded record", never zero fire. The colour scale is capped at the 98th percentile so one extreme day does not wash out the season.
+"How to read this page" panel on the Overview, explaining the stripes, the verdict, the map, harmonization and the downloads.
+Compare tab upgrades
+The open country is pre-selected as Country A and the one open before it fills Country B (both can still be changed).
+Maps are now interactive and follow the base map chosen in the sidebar.
+Monthly burning calendars for both countries, with a selectable colour ramp, an optional shared colour scale, and a seasonal-pattern chart.
+Timelapse "Simple (no map tiles)" view. Draws the grid and the country outline on a plain dark canvas, so the timelapse works on any network.
+Percentile in the verdict. The current-month verdict now also says how it ranks, for example "higher than 62% of those years".
 
 @queriesonhold@gmail.com for more info.
