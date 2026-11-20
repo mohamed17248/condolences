@@ -1,4 +1,4 @@
-# Fire Activity Explorer
+# PROJECT The Burn Record
 
 > See [CHANGELOG.md](CHANGELOG.md) for everything added, changed, and fixed
 > relative to the original prototype.
