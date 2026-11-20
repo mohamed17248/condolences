@@ -1,6 +1,7 @@
 """
 
-The Burn Record made by Ahmed sultan & Mohamed abbas (queriesonhold/egobreaking & mohamed17248)
+The Burn Record
+Made by Ahmed Sultan, Mohamed Abbas, Eyad Elbana and Mohamed Zaghloul
 Run:    streamlit run app.py
 Data:   FIRMS archive downloads (https://firms.modaps.eosdis.nasa.gov/download/)
         saved in ./data/<country>.csv or ./data/<country>.parquet
@@ -1257,15 +1258,22 @@ TILES = {
     "Dark": dict(
         tiles=f"{ESRI}/Canvas/World_Dark_Gray_Base/MapServer/tile/{{z}}/{{y}}/{{x}}",
         attr="Tiles © Esri — Esri, HERE, Garmin, © OpenStreetMap contributors",
+        native=16,
     ),
     "Light": dict(
         tiles=f"{ESRI}/Canvas/World_Light_Gray_Base/MapServer/tile/{{z}}/{{y}}/{{x}}",
         attr="Tiles © Esri — Esri, HERE, Garmin, © OpenStreetMap contributors",
+        native=16,
     ),
-    "Streets": dict(tiles="OpenStreetMap", attr="© OpenStreetMap contributors"),
+    "Streets": dict(
+        tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        attr="© OpenStreetMap contributors",
+        native=19,
+    ),
     "Satellite": dict(
         tiles=f"{ESRI}/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}",
         attr="Tiles © Esri — Maxar, Earthstar Geographics",
+        native=19,
     ),
     "Blank (offline)": None,
 }
@@ -1280,19 +1288,83 @@ MAP_LEGEND_STYLE = (
 )
 
 
+MAP_FIX_JS = '''
+(function () {
+  if (!window.L || !L.Map || window.__burnFix) return;
+  window.__burnFix = true;
+  var all = [];
+  // every Leaflet map created on this page registers itself (no reliance on globals)
+  L.Map.addInitHook(function () { all.push(this); });
+  // remember the bounds each map was asked to fit, so they can be re-applied once the
+  // frame has its final size (the first fit often runs while the frame is still narrow)
+  var _fb = L.Map.prototype.fitBounds;
+  L.Map.prototype.fitBounds = function (b, o) { this.__fit = [b, o]; return _fb.call(this, b, o); };
+
+  function watch(m) {
+    if (m.__watched) return;
+    m.__watched = true;
+    var c = m.getContainer();
+    ['pointerdown', 'wheel', 'touchstart', 'keydown'].forEach(function (ev) {
+      c.addEventListener(ev, function () { m.__touched = true; }, { passive: true });
+    });
+  }
+  function limit(m) {
+    // never zoom out past the point where the world no longer fills the frame
+    var z = m.getBoundsZoom([[-85.06, -180], [85.06, 180]], true);
+    z = Math.max(z, 2);
+    m.setMinZoom(z);
+    if (m.getZoom() < z) m.setZoom(z);
+  }
+  function fix() {
+    all.forEach(function (m) {
+      try {
+        watch(m);
+        m.invalidateSize();
+        limit(m);
+        // re-fit to the country/area, but never fight a user who already panned or zoomed
+        if (m.__fit && !m.__touched) m.fitBounds(m.__fit[0], m.__fit[1]);
+      } catch (e) {}
+    });
+  }
+  [50, 250, 700, 1500, 3000].forEach(function (t) { setTimeout(fix, t); });
+  window.addEventListener('load', fix);
+  window.addEventListener('resize', fix);
+  if (window.ResizeObserver) new ResizeObserver(fix).observe(document.documentElement);
+
+  var bad = 0, banner = null;
+  document.addEventListener('error', function (e) {
+    var t = e.target;
+    if (!t || !t.className || String(t.className).indexOf('leaflet-tile') < 0) return;
+    bad += 1;
+    if (bad >= 4 && !banner) {
+      banner = document.createElement('div');
+      banner.textContent = 'Base map tiles could not be loaded (network or provider).';
+      banner.style.cssText = 'position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:99999;' +
+        'background:rgba(12,13,11,.92);color:#ecc063;border:1px solid rgba(236,192,99,.5);' +
+        'padding:5px 10px;border-radius:4px;font:12px sans-serif;';
+      document.body.appendChild(banner);
+    }
+  }, true);
+})();
+'''
+
+
 def base_map(style: str) -> folium.Map:
     m = folium.Map(
-        location=[18, 12],
-        zoom_start=2,
+        location=[8, 15],
+        zoom_start=2.5,
         control_scale=True,
         prefer_canvas=True,
         tiles=None,
-        min_zoom=2,
-        max_zoom=16,
+        # 2.5: at zoom 2 the world is only 1024 px wide, which leaves empty bars on
+        # either side of any frame wider than that.
+        min_zoom=2.5,
+        max_zoom=18,
         # Keep the viewport inside the world so panning can't drift into the
         # grey void left of/right of the dateline.
         max_bounds=[[-85.06, -180.0], [85.06, 180.0]],
-        max_bounds_viscosity=0.5,
+        max_bounds_viscosity=1.0,
+        zoom_snap=0.25,
     )
     cfg = TILES[style]
     # Dark canvas behind tiles on every style: the iframe shows this while
@@ -1301,15 +1373,68 @@ def base_map(style: str) -> folium.Map:
         folium.Element("<style>.leaflet-container{background:#121212!important}</style>")
     )
     if cfg:
-        folium.TileLayer(tiles=cfg["tiles"], attr=cfg["attr"], name=style, max_zoom=16,
-                         no_wrap=True).add_to(m)
+        folium.TileLayer(tiles=cfg["tiles"], attr=cfg["attr"], name=style, max_zoom=18,
+                         max_native_zoom=cfg.get("native", 16), no_wrap=True,
+                         # no_wrap alone still requests tiles beyond the dateline (Esri answers
+                         # with grey "Map data not available"); bounds stops that.
+                         bounds=[[-85.06, -180.0], [85.06, 180.0]]).add_to(m)
+    # Re-measure the map once the iframe has its final size, otherwise Leaflet only
+    # requests tiles for the small area it first saw (blank / half-loaded base maps).
+    # Must go in the script section: st_folium runs that, but does not execute <script>
+    # tags placed in the html section.
+    m.get_root().script.add_child(folium.Element(MAP_FIX_JS))
     return m
+
+
+def _set_view(m, south, west, north, east, width_px, height_px, pad=30):
+    """Centre and zoom a map on a bounding box, computed here rather than with
+    fit_bounds in the browser (which measured the frame before it reached its final
+    width and cropped countries). width_px is a conservative guess of the frame width."""
+    def merc(lat):
+        lat = float(np.clip(lat, -85.05, 85.05))
+        return float(np.log(np.tan(np.pi / 4 + np.radians(lat) / 2)))
+
+    dx = max(float(east) - float(west), 1e-4) / 360.0
+    dy = max(merc(north) - merc(south), 1e-5) / (2 * np.pi)
+    aw, ah = max(width_px - 2 * pad, 80), max(height_px - 2 * pad, 80)
+    z = min(np.log2(aw / (256.0 * dx)), np.log2(ah / (256.0 * dy)))
+    z = float(np.floor(np.clip(z, 2.5, 16.0) * 4) / 4)
+    cy = (merc(north) + merc(south)) / 2
+    lat = float(np.degrees(2 * np.arctan(np.exp(cy)) - np.pi / 2))
+    m.location = [lat, (float(west) + float(east)) / 2]
+    m.options["zoom"] = z
+    if hasattr(m, "zoom_start"):  # older folium versions
+        m.zoom_start = z
 
 
 def _group_codes(series: pd.Series) -> np.ndarray:
     if isinstance(series.dtype, pd.CategoricalDtype):
         return series.cat.codes.to_numpy()
     return pd.factorize(series)[0]
+
+
+def _point_feature(la, lo, color, tip):
+    return {
+        "type": "Feature",
+        "properties": {"color": color, "tip": tip},
+        "geometry": {"type": "Point", "coordinates": [lo, la]},
+    }
+
+
+def _add_point_layer(group, feats, opacity):
+    """One GeoJSON layer instead of thousands of separate Leaflet marker objects:
+    far less HTML/JS to build, ship and parse on every map redraw."""
+    folium.GeoJson(
+        {"type": "FeatureCollection", "features": feats},
+        marker=folium.CircleMarker(radius=3, weight=0, fill=True),
+        style_function=lambda f: {
+            "color": f["properties"]["color"],
+            "fillColor": f["properties"]["color"],
+            "weight": 0,
+            "fillOpacity": opacity,
+        },
+        tooltip=folium.GeoJsonTooltip(fields=["tip"], labels=False, sticky=False),
+    ).add_to(group)
 
 
 def add_points(m, sub, color_by="sensor", max_points=3000):
@@ -1349,20 +1474,14 @@ def add_points(m, sub, color_by="sensor", max_points=3000):
     if color_by == "solar":
         tod_colors = {"Daytime (06–18h)": DAY_COLOR, "Overnight (18–06h)": NIGHT_COLOR}
         tods = np.where((pts["local_hour"] >= 6) & (pts["local_hour"] < 18), "Daytime (06–18h)", "Overnight (18–06h)")
-        for la, lo, d, sn, lh_, td in zip(
-            pts["latitude"], pts["longitude"], dates, pts["sensor"], pts["local_hour"], tods
-        ):
-            col = tod_colors[td]
-            folium.CircleMarker(
-                location=[float(la), float(lo)],
-                radius=3,
-                color=col,
-                weight=0,
-                fill=True,
-                fill_color=col,
-                fill_opacity=0.68,
-                tooltip=f"{d} · ~{int(lh_):02d}:00 solar ({sn})",
-            ).add_to(layer_grp)
+        feats = [
+            _point_feature(float(la), float(lo), tod_colors[td],
+                           f"{d} · ~{int(lh_):02d}:00 solar ({sn})")
+            for la, lo, d, sn, lh_, td in zip(
+                pts["latitude"], pts["longitude"], dates, pts["sensor"], pts["local_hour"], tods
+            )
+        ]
+        _add_point_layer(layer_grp, feats, 0.68)
         layer_grp.add_to(m)
         items = "&nbsp;&nbsp;".join(
             f'<span style="display:inline-flex;align-items:center;gap:5px;">'
@@ -1372,21 +1491,16 @@ def add_points(m, sub, color_by="sensor", max_points=3000):
         )
         m.get_root().html.add_child(folium.Element(f'<div style="{MAP_LEGEND_STYLE}">{items}</div>'))
     else:
-        for la, lo, d, sn, pl, wt in zip(
-            pts["latitude"], pts["longitude"], dates, pts["sensor"], pts["platform"], pts["weight"]
-        ):
-            col = SENSOR_COLORS.get(sn, OTHER_COLOR)
-            plat_txt = f" ({pl})" if pl and pl != "UNKNOWN" else ""
-            folium.CircleMarker(
-                location=[float(la), float(lo)],
-                radius=3,
-                color=col,
-                weight=0,
-                fill=True,
-                fill_color=col,
-                fill_opacity=0.65,
-                tooltip=f"{d} · {sn}{plat_txt} · {wt:.2f} eq.",
-            ).add_to(layer_grp)
+        feats = [
+            _point_feature(
+                float(la), float(lo), SENSOR_COLORS.get(sn, OTHER_COLOR),
+                f"{d} · {sn}{f' ({pl})' if pl and pl != 'UNKNOWN' else ''} · {wt:.2f} eq.",
+            )
+            for la, lo, d, sn, pl, wt in zip(
+                pts["latitude"], pts["longitude"], dates, pts["sensor"], pts["platform"], pts["weight"]
+            )
+        ]
+        _add_point_layer(layer_grp, feats, 0.65)
         layer_grp.add_to(m)
         present = [sn for sn in ("MODIS", "VIIRS") if sn in set(pts["sensor"])] or sorted(set(pts["sensor"]))
         items = "&nbsp;&nbsp;".join(
@@ -2356,6 +2470,12 @@ elif st.session_state.pop("_had_region", False):
     st.session_state["_map_epoch"] = st.session_state.get("_map_epoch", 0) + 1
 bbox = regions[match] if match else None
 match_title = match.title() if match else ""
+_hist = st.session_state.setdefault("_region_history", [])
+if match and (not _hist or _hist[-1] != match):
+    if match in _hist:
+        _hist.remove(match)
+    _hist.append(match)
+    del _hist[:-8]
 
 sb.markdown('<div class="sb-label">Area of interest</div>', unsafe_allow_html=True)
 aoi_mode = sb.radio(
@@ -2368,7 +2488,7 @@ if match and aoi_mode == "Draw on map":
     saved = st.session_state.get("aoi_draw")
     if saved and saved["region"] == match:
         aoi_poly = shapely_wkt.loads(saved["wkt"])
-    sb.caption("Use the polygon, rectangle, or circle tool at the top left of the map.")
+    sb.caption("Use the polygon, rectangle, or circle tool at the top left of the map. To start over, press Clear drawn area.")
     sb.button("Clear drawn area", on_click=lambda: st.session_state.pop("aoi_draw", None))
 elif match and aoi_mode == "Coordinates":
     kind = sb.radio("Shape", ["Bounding box", "Point and radius"], horizontal=True, label_visibility="collapsed")
@@ -2683,14 +2803,14 @@ def render_map(msub, tag="all", height=640):
         Draw(
             export=False,
             draw_options={"polyline": False, "marker": False, "circlemarker": False},
-            edit_options={"edit": False},
+            edit_options={"edit": False, "remove": False},
         ).add_to(m)
 
     if aoi_poly is not None:
         minx, miny, maxx, maxy = aoi_poly.bounds
-        m.fit_bounds([[miny, minx], [maxy, maxx]], padding=(20, 20))
+        _set_view(m, miny, minx, maxy, maxx, 780, height)
     elif bbox:
-        m.fit_bounds([[bbox[0], bbox[2]], [bbox[1], bbox[3]]])
+        _set_view(m, bbox[0], bbox[2], bbox[1], bbox[3], 780, height)
     m.get_root().html.add_child(folium.Element(ATTRIBUTION_FIX))
 
     ret_objs = []
@@ -2765,112 +2885,236 @@ def render_field_notes(notes):
     st.markdown(f'<div class="notes-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
 
 
-def _country_static_map(key, canon):
-    """Non-interactive geopandas map + summary stats for one country."""
-    import io
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import geopandas as gpd
-    from shapely.geometry import Point
+_CMP_COLS = ["latitude", "longitude", "acq_date", "sensor"]
 
-    path = find_data_file(key, canon)
-    if path is None or key not in geoms_wkb:
-        return None, None
-    if path.suffix == ".parquet":
-        df = pd.read_parquet(path)
-    else:
-        df = pd.read_csv(path, usecols=lambda c: c.strip().lower() in
-                         {"latitude", "longitude", "acq_date", "satellite", "instrument"})
-    df.columns = [c.strip().lower() for c in df.columns]
-    df = df.dropna(subset=["latitude", "longitude", "acq_date"])
+
+def _load_compare_frame(path: Path):
+    """Only the four columns the comparison needs, straight from the parquet cache
+    that read_file already writes (no CSV re-parse, no extra copy kept in RAM)."""
+    pq_path, _ = _cache_paths(path)
+    if pq_path.exists():
+        try:
+            return pd.read_parquet(pq_path, columns=_CMP_COLS)
+        except Exception:
+            pass
+    df, _ = read_file(str(path), path.stat().st_mtime)
+    return df[_CMP_COLS]
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def _country_compare_data(key, path_str, mtime):
+    """Headline stats, monthly/annual counts and a small point sample for one
+    country. Cached per file, so unrelated widget clicks never recompute it."""
+    df = _load_compare_frame(Path(path_str))
     if df.empty:
-        return None, None
-    df["acq_date"] = pd.to_datetime(df["acq_date"], errors="coerce")
-    df = df.dropna(subset=["acq_date"])
+        return None, None, None, None
 
-    # stats on the full record
-    yrs = df["acq_date"].dt.year
+    dates = df["acq_date"]
+    yrs = dates.dt.year
     counts = yrs.value_counts().sort_index()
-    full_years = [y for y in counts.index if counts.loc[y] > 0]
-    slope = icpt = None
     if len(counts) >= 5:
-        slope, icpt = theil_sen(counts.index.to_numpy(float), counts.to_numpy(float))
+        slope, _ = theil_sen(counts.index.to_numpy(float), counts.to_numpy(float))
         med = float(np.median(counts.to_numpy(float)))
         trend_pct = slope / med * 100 if med > 0 else None
     else:
         trend_pct = None
-    peak_m = int(df["acq_date"].dt.month.value_counts().idxmax())
+    monthly = dates.dt.month.value_counts().reindex(range(1, 13), fill_value=0).sort_index()
     stats = dict(
         country=key.replace("_", " ").title(),
         detections=len(df),
-        years=f"{int(yrs.min())}–{int(yrs.max())}",
-        peak_month=calendar.month_name[peak_m],
+        years=f"{int(yrs.min())}\u2013{int(yrs.max())}",
+        peak_month=calendar.month_name[int(monthly.idxmax())],
         trend=(f"{trend_pct:+.1f}%/yr" if trend_pct is not None else "n/a"),
     )
-    monthly = df.groupby(df["acq_date"].dt.month).size().reindex(range(1, 13), fill_value=0)
-    annual = counts
 
-    # map on a sample
-    plot_df = df.sample(min(len(df), 40000), random_state=0) if len(df) > 40000 else df
-    plat = normalize_platform(plot_df["satellite"]) if "satellite" in plot_df else pd.Series("UNKNOWN", index=plot_df.index)
-    sensor = infer_sensor(plot_df, plat)
-    sensor_name = np.asarray(sensor.astype(str))
+    n_pts = min(len(df), 2500)
+    sel = np.sort(np.random.default_rng(0).choice(len(df), n_pts, replace=False)) if len(df) > n_pts else np.arange(len(df))
+    pts = pd.DataFrame({
+        "lat": df["latitude"].to_numpy(float)[sel],
+        "lon": df["longitude"].to_numpy(float)[sel],
+        "sensor": df["sensor"].astype(str).to_numpy()[sel],
+        "date": dates.iloc[sel].dt.strftime("%Y-%m-%d").to_numpy(),
+    })
+    return stats, monthly, counts, pts
 
-    geom = shape(shapely.from_wkb(geoms_wkb[key]))
-    boundary = gpd.GeoSeries([geom], crs="EPSG:4326")
 
-    fig, ax = plt.subplots(figsize=(6.4, 5.4))
-    fig.patch.set_facecolor("#121212")
-    ax.set_facecolor("#121212")
-    boundary.plot(ax=ax, color="#262626", edgecolor="#8f8f8f", linewidth=0.8, zorder=1)
-    la = plot_df["latitude"].to_numpy(float)
-    lo = plot_df["longitude"].to_numpy(float)
-    for sname, col in (("MODIS", "#22D3EE"), ("VIIRS", "#A78BFA")):
-        m = sensor_name == sname
-        if m.any():
-            ax.scatter(lo[m], la[m], s=1.6, c=col, alpha=0.45, zorder=2, linewidths=0)
-    ax.set_title(stats["country"], color="#e0e0e0", fontsize=13, pad=10)
-    ax.set_xticks([]); ax.set_yticks([])
-    for sp in ax.spines.values():
-        sp.set_visible(False)
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=140, bbox_inches="tight", facecolor="#121212")
-    plt.close(fig)
-    return buf.getvalue(), stats, monthly, annual
+def _country_compare(key, canon):
+    path = find_data_file(key, canon)
+    if path is None or key not in geoms_wkb:
+        return None, None, None, None
+    return _country_compare_data(key, str(path), path.stat().st_mtime)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def _simple_outline(key):
+    return mapping(shapely.from_wkb(geoms_wkb[key]).simplify(0.02, preserve_topology=True))
+
+
+def _compare_map(k, pts, slot):
+    """Interactive map for one comparison slot, using the sidebar's base map."""
+    m = base_map(style)
+    folium.GeoJson(
+        _simple_outline(k),
+        style_function=lambda f: {"color": "#b8b8b8", "weight": 1.2, "opacity": 0.7, "fillOpacity": 0.0},
+    ).add_to(m)
+    if pts is not None and len(pts):
+        feats = [
+            _point_feature(float(la), float(lo), SENSOR_COLORS.get(sn, OTHER_COLOR), f"{d} \u00b7 {sn}")
+            for la, lo, sn, d in zip(pts["lat"], pts["lon"], pts["sensor"], pts["date"])
+        ]
+        grp = folium.FeatureGroup(name="Detections")
+        _add_point_layer(grp, feats, 0.65)
+        grp.add_to(m)
+        present = [sn for sn in ("MODIS", "VIIRS") if sn in set(pts["sensor"])]
+        items = "&nbsp;&nbsp;".join(
+            f'<span style="display:inline-flex;align-items:center;gap:5px;">'
+            f'<span style="width:8px;height:8px;border-radius:50%;background:{SENSOR_COLORS[sn]};display:inline-block;"></span>'
+            f"{sn}</span>"
+            for sn in present
+        )
+        if items:
+            m.get_root().html.add_child(folium.Element(f'<div style="{MAP_LEGEND_STYLE}">{items}</div>'))
+    bb = regions.get(k)
+    if bb:
+        _set_view(m, bb[0], bb[2], bb[1], bb[3], 560, 420)
+    m.get_root().html.add_child(folium.Element(ATTRIBUTION_FIX))
+    st_folium(m, height=420, use_container_width=True, returned_objects=[],
+              key=f"cmpmap-{slot}-{k}-{style}")
+
+
+@st.cache_data(show_spinner="Harmonizing for the calendar\u2026", max_entries=8)
+def _country_calendar(path_str, mtime, drop_low_, veg_only_, viirs_mode_, seasonal_, min_monthly_, calib_year_):
+    """Harmonized (VIIRS-equivalent) detections per year x month for one country."""
+    hot_c, info_c = build_dataset(path_str, mtime, drop_low_, veg_only_, viirs_mode_, seasonal_,
+                                  min_monthly_, calib_year_)
+    if hot_c.empty:
+        return None
+    piv = hot_c.groupby(["year", "month"])["weight"].sum().unstack("month").reindex(columns=range(1, 13))
+    piv = piv.reindex(range(int(piv.index.min()), int(piv.index.max()) + 1)).fillna(0.0)
+    d0_, d1_ = pd.Timestamp(info_c["dmin"]), pd.Timestamp(info_c["dmax"])
+    first_m, last_m = pd.Timestamp(d0_.year, d0_.month, 1), pd.Timestamp(d1_.year, d1_.month, 1)
+    for y in piv.index:
+        for mo in piv.columns:
+            ts = pd.Timestamp(int(y), int(mo), 1)
+            if ts < first_m or ts > last_m:
+                piv.loc[y, mo] = np.nan
+    return piv
+
+
+def _cmp_heatmap(piv, title, ramp, zmax, key):
+    z = piv.copy()
+    z.columns = [calendar.month_abbr[m] for m in range(1, 13)]
+    fig = px.imshow(z, color_continuous_scale=ramp, zmin=0, zmax=zmax, aspect="auto",
+                    labels=dict(x="Month", y="Year", color="Detections"))
+    fig.update_yaxes(type="category", automargin=True, tickfont=dict(color="#8f8f8f"))
+    fig.update_xaxes(automargin=True, tickfont=dict(color="#8f8f8f"))
+    fig.update_layout(coloraxis_colorbar=dict(title=None, thickness=10, tickfont=dict(color="#8f8f8f")))
+    show(tidy(fig, title, max(300, 22 * len(z) + 110)), key)
+
+
+def render_compare_calendars(a, b):
+    st.markdown('<div class="sb-label">Burning calendars</div>', unsafe_allow_html=True)
+    pivs = {}
+    for k in (a, b):
+        path = find_data_file(k, canon)
+        if path is None:
+            continue
+        pivs[k] = _country_calendar(str(path), path.stat().st_mtime, drop_low, veg_only, viirs_key,
+                                    seasonal_on, int(min_monthly), int(calib_year))
+    if len(pivs) < 2 or any(v is None for v in pivs.values()):
+        st.info("Calendars need harmonized data for both countries.")
+        return
+    c1, c2 = st.columns([1, 2])
+    ramp_c = c1.selectbox("Colour ramp", ["Inferno", "Viridis", "Cividis"], key="cmp_ramp",
+                          help="Perceptually uniform ramps readable with colour-vision deficiency.")
+    shared = c2.checkbox("Same colour scale for both countries", True, key="cmp_shared",
+                         help="On: colours mean the same number of detections in both calendars, so the "
+                              "busier country stands out. Off: each calendar uses its own range.")
+
+    def top98(p):
+        v = p.to_numpy(float)
+        v = v[np.isfinite(v) & (v > 0)]
+        return float(np.percentile(v, 98)) if v.size else 1.0
+
+    zmaxes = {k: top98(p) for k, p in pivs.items()}
+    if shared:
+        zshared = max(zmaxes.values())
+        zmaxes = {k: zshared for k in pivs}
+    cols = st.columns(2)
+    for k, col in zip((a, b), cols):
+        with col:
+            _cmp_heatmap(pivs[k], f"Monthly detections, {k.title()}", ramp_c, max(zmaxes[k], 1.0), f"cmp-cal-{k}")
+    st.caption(
+        "Harmonized (VIIRS-equivalent) detections per month, using the sidebar's data-cleaning settings. "
+        "Blank cells are outside the loaded record."
+    )
+
+    # Seasonal pattern: share of the usual year's burning that falls in each month
+    mn = [calendar.month_abbr[m] for m in range(1, 13)]
+    fig_s = go.Figure()
+    for k, col in ((a, "#22D3EE"), (b, "#A78BFA")):
+        p = pivs[k]
+        complete = p.dropna(how="any")
+        med = (complete if len(complete) >= 3 else p).median()
+        tot = float(med.sum())
+        if tot > 0:
+            fig_s.add_trace(go.Scatter(x=mn, y=(med / tot * 100).to_numpy(float), mode="lines+markers",
+                                       name=k.title(), line=dict(color=col, width=2.5)))
+    fig_s.update_yaxes(title="% of the usual year", ticksuffix="%")
+    show(tidy(fig_s, "Seasonal pattern: when each country usually burns", 320), f"cmp-season-{a}-{b}")
+    st.caption("Median month as a share of the median year, so countries with very different totals "
+               "can be compared on timing alone.")
 
 
 def render_compare():
     st.markdown(
-        '<p class="lede">Pick two countries with loaded archives to compare their fire record. '
-        "Static geopandas maps (not interactive) sit side by side with headline stats.</p>",
+        '<p class="lede">Compare two countries side by side. The country you have open is '
+        "pre-selected as <b>A</b> and the one you had open before it as <b>B</b>. Maps use "
+        "the base map chosen in the sidebar.</p>",
         unsafe_allow_html=True,
     )
     opts = sorted(k for k in regions if has_data(k) and k not in ALIASES and k in geoms_wkb)
     if len(opts) < 2:
         st.info("At least two country archives are needed for comparison.")
         return
+
+    # Re-sync the two slots whenever the open country changes
+    hist = st.session_state.get("_region_history", [])
+    want_a = match if match in opts else None
+    want_b = next((k for k in reversed(hist) if k in opts and k != want_a), None)
+    if st.session_state.get("_cmp_sync") != match:
+        st.session_state["_cmp_sync"] = match
+        if want_a:
+            st.session_state["cmp_a"] = want_a
+        if want_b:
+            st.session_state["cmp_b"] = want_b
+    if st.session_state.get("cmp_a") not in opts:
+        st.session_state["cmp_a"] = want_a or opts[0]
+    if st.session_state.get("cmp_b") not in opts:
+        st.session_state["cmp_b"] = want_b or next(k for k in opts if k != st.session_state["cmp_a"])
+
     c1, c2 = st.columns(2)
-    a = c1.selectbox("Country A", opts, key="cmp_a")
-    b = c2.selectbox("Country B", opts, index=min(1, len(opts) - 1), key="cmp_b")
+    a = c1.selectbox("Country A", opts, key="cmp_a", format_func=lambda k: k.title() + ("  \u00b7 open now" if k == match else ""))
+    b = c2.selectbox("Country B", opts, key="cmp_b", format_func=lambda k: k.title() + ("  \u00b7 open now" if k == match else ""))
     if a == b:
         st.warning("Pick two different countries.")
         return
-    maps, stats, monthly_a, annual_a = {}, {}, {}, {}
-    with st.spinner("Rendering static maps…"):
+    stats, monthly_a, annual_a, pts_a = {}, {}, {}, {}
+    with st.spinner("Loading comparison\u2026"):
         for k in (a, b):
-            png, stt, mo, an = _country_static_map(k, canon)
-            maps[k], stats[k], monthly_a[k], annual_a[k] = png, stt, mo, an
+            stt, mo, an, pt = _country_compare(k, canon)
+            stats[k], monthly_a[k], annual_a[k], pts_a[k] = stt, mo, an, pt
     cols = st.columns(2)
-    for k, col in zip((a, b), cols):
+    for slot, (k, col) in enumerate(zip((a, b), cols)):
         with col:
-            if maps[k]:
-                st.image(maps[k], width="stretch")
             if stats[k]:
+                _compare_map(k, pts_a[k], slot)
                 st.markdown(
-                    f"**{stats[k]['country']}** — {stats[k]['detections']:,} detections · "
-                    f"{stats[k]['years']} · peak {stats[k]['peak_month']} · trend {stats[k]['trend']}"
+                    f"**{stats[k]['country']}** \u2014 {stats[k]['detections']:,} detections \u00b7 "
+                    f"{stats[k]['years']} \u00b7 peak {stats[k]['peak_month']} \u00b7 trend {stats[k]['trend']}"
                 )
+            else:
+                st.info(f"No usable detections for {k.title()}.")
     if all(stats.values()):
         st.dataframe(pd.DataFrame([stats[a], stats[b]]), hide_index=True)
 
@@ -2911,6 +3155,8 @@ def render_compare():
         fig_y.update_yaxes(gridcolor="rgba(224,224,224,0.08)", zeroline=False)
         fig_y.update_xaxes(gridcolor="rgba(224,224,224,0.05)", tickangle=-45)
         show(fig_y, f"cmp-year-{a}-{b}")
+
+    render_compare_calendars(a, b)
 
 
 def render_predict(sub, style, match, bbox, aoi_poly, region_text, skey):
@@ -2990,7 +3236,7 @@ def render_predict(sub, style, match, bbox, aoi_poly, region_text, skey):
         la=("latitude", "mean"), lo=("longitude", "mean"),
     ).sort_values("w", ascending=False).head(30)
 
-    m = base_map(style if style in ("Dark", "Light", "Satellite") else "Dark")
+    m = base_map(style)
     max_w = float(cl["w"].max()) if len(cl) else 1.0
     for _, r in cl.iterrows():
         intensity = r["w"] / max_w
@@ -3027,10 +3273,10 @@ def render_predict(sub, style, match, bbox, aoi_poly, region_text, skey):
                                       "fillColor": AOI_COLOR, "fillOpacity": 0.05},
         ).add_to(m)
     elif bbox:
-        m.fit_bounds([[bbox[0], bbox[2]], [bbox[1], bbox[3]]])
+        _set_view(m, bbox[0], bbox[2], bbox[1], bbox[3], 900, 560)
     else:
-        m.fit_bounds([[cl["la"].min() - 0.5, cl["lo"].min() - 0.5],
-                      [cl["la"].max() + 0.5, cl["lo"].max() + 0.5]])
+        _set_view(m, cl["la"].min() - 0.5, cl["lo"].min() - 0.5,
+                  cl["la"].max() + 0.5, cl["lo"].max() + 0.5, 900, 560)
     st_folium(m, height=560, use_container_width=True, returned_objects=[],
               key=f"spread-{match}-{window}-{rate}-{horizon}-{aoi_key}")
 
@@ -3041,6 +3287,15 @@ def render_predict(sub, style, match, bbox, aoi_poly, region_text, skey):
 
 
 def render_overview():
+    with st.expander("How to read this page", expanded=False):
+        st.markdown(
+            "- **Stripes** rate every year against the usual (median) year: orange is heavier, purple is quieter.\n"
+            "- **Verdict** compares the latest month in the record with the same days in every earlier year.\n"
+            "- **Map** shows the harmonized record; draw an area or type coordinates in the sidebar to focus on it.\n"
+            "- **Harmonization**: MODIS (2000-2012) is scaled to VIIRS and spliced, so the sensor of origin "
+            "no longer matters. See *Method & data* for the numbers behind it.\n"
+            "- **Downloads**: hotspots CSV, monthly anomaly CSV, and a written report are under *Method & data > Data*."
+        )
     render_stripes(verdicts, title="Every year at a glance")
     st.caption(
         "One stripe per year. Orange marks heavier fire years than usual, purple marks quieter years, "
@@ -3072,7 +3327,8 @@ def render_overview():
                 f'<div class="verdict-meta">{escape(badge)} · Rank {status["rank"]} of {status["n"]}</div>'
                 f'<div class="verdict-head">{HERO_LINES[status["level"]]}</div>'
                 f'<div class="verdict-body">{calendar.month_name[lm]} 1–{last_day}, {ly}: {fmt(current)} detections, '
-                f"{ratio_txt} for the same days across the {len(hist)} earlier years.</div></div>",
+                f"{ratio_txt} for the same days across the {len(hist)} earlier years. "
+                f"That is higher than {status['pct']:.0f}% of those years.</div></div>",
                 unsafe_allow_html=True,
             )
 
@@ -3235,6 +3491,82 @@ def month_row(piv, y):
     return pd.Series(np.nan, index=range(1, 13))
 
 
+@st.cache_data(show_spinner=False, max_entries=6)
+def daily_series(skey):
+    """Weighted detections per calendar day for the selected area and period."""
+    return get_sub(*skey).groupby("acq_date")["weight"].sum()
+
+
+def render_daily_calendar(skey, years_present, ramp, widget_key, data_lo, data_hi):
+    """Burning calendar at day resolution: weeks run across, weekdays run down.
+
+    Days outside the loaded record are left blank; days inside it with no
+    detections show as zero, so "quiet" is never confused with "no data"."""
+    years_present = list(years_present)
+    if not years_present:
+        return
+    ds = daily_series(skey)
+    if ds.empty:
+        return
+    st.markdown('<div class="ribbon-title">Daily burning calendar</div>', unsafe_allow_html=True)
+    if len(years_present) > 1:
+        year = st.select_slider(
+            "Year for the daily calendar",
+            options=years_present,
+            value=years_present[-1],
+            key=widget_key,
+        )
+    else:
+        year = years_present[0]
+
+    days = pd.date_range(f"{year}-01-01", f"{year}-12-31")
+    lo = max(pd.Timestamp(skey[7]), pd.Timestamp(data_lo))
+    hi = min(pd.Timestamp(skey[8]), pd.Timestamp(data_hi))
+    inside = np.asarray((days >= lo) & (days <= hi))
+    vals = ds.reindex(days).fillna(0.0).to_numpy(float)
+    vals = np.where(inside, vals, np.nan)
+
+    first = days[0].weekday()
+    pos = np.arange(len(days))
+    week = (pos + first) // 7
+    wday = days.weekday.to_numpy()
+    n_weeks = int(week.max()) + 1
+    z = np.full((7, n_weeks), np.nan)
+    txt = np.full((7, n_weeks), "", dtype=object)
+    z[wday, week] = vals
+    for d, w_, v in zip(days, week, vals):
+        label = "no data" if np.isnan(v) else f"{v:,.0f} detections"
+        txt[d.weekday(), w_] = f"{d:%a %d %b %Y}: {label}"
+
+    pos_vals = z[np.isfinite(z) & (z > 0)]
+    zmax = max(float(np.percentile(pos_vals, 98)), 1.0) if pos_vals.size else 1.0
+    tick_w = [(pd.Timestamp(year, m, 1).dayofyear - 1 + first) // 7 for m in range(1, 13)]
+
+    fig = go.Figure(
+        go.Heatmap(
+            z=z,
+            text=txt,
+            hovertemplate="%{text}<extra></extra>",
+            colorscale=ramp,
+            zmin=0,
+            zmax=zmax,
+            xgap=2,
+            ygap=2,
+            colorbar=dict(title=None, thickness=10, tickfont=dict(color="#8f8f8f")),
+        )
+    )
+    fig.update_yaxes(autorange="reversed", tickmode="array", tickvals=[0, 2, 4],
+                     ticktext=["Mon", "Wed", "Fri"], showgrid=False)
+    fig.update_xaxes(tickmode="array", tickvals=tick_w,
+                     ticktext=[calendar.month_abbr[m] for m in range(1, 13)], showgrid=False)
+    show(tidy(fig, f"Every day of {year}", 250), f"daycal-{widget_key}-{year}")
+    st.caption(
+        "One cell per day (VIIRS-equivalent detections). The colour scale is capped at the 98th "
+        "percentile so a single extreme day does not wash out the rest of the season. "
+        "Blank cells are outside the loaded record, not zero fire."
+    )
+
+
 # Main workspace
 if sub is not None:
     # Section nav: only the active section's body executes on each rerun,
@@ -3260,21 +3592,26 @@ if sub is not None:
             _top = _top[0] if _top else _nav_labels[_nav_i]
     else:
         _top = st.radio("Section", _nav_labels,
-                        index=_nav_labels.index(_nav_i),
+                        index=_nav_i,
                         horizontal=True, label_visibility="collapsed", key="section_nav")
     _nav_pick = _top if _top in _nav_labels else _nav_labels[_nav_i]
     if _nav_pick in _sub_map:
         _subs = _sub_map[_nav_pick]
-        _cur = st.session_state.get("sub_" + _nav_pick, _subs[0])
-        _cur = _cur if _cur in _subs else _subs[0]
-        _pk = st.pills(" ", _subs, selection_mode="single", key="sub_" + _nav_pick,
+        _sk = "sub_" + _nav_pick
+        # Always keep one sub-tab selected and highlighted. Before, the first sub-tab was
+        # shown without being highlighted (so clicking it looked like it did nothing), and
+        # clicking the selected one deselected it.
+        if st.session_state.get(_sk) not in _subs:
+            _fallback = st.session_state.get("_last_" + _sk)
+            if _fallback not in _subs:
+                _fallback = _start if _start in _subs else _subs[0]
+            st.session_state[_sk] = _fallback
+        _pk = st.pills(" ", _subs, selection_mode="single", key=_sk,
                        label_visibility="collapsed")
-        if isinstance(_pk, str):
-            _sel = _pk
-        elif isinstance(_pk, (list, tuple)) and _pk:
-            _sel = _pk[0]
-        else:
-            _sel = _cur
+        if isinstance(_pk, (list, tuple)):
+            _pk = _pk[0] if _pk else None
+        _sel = _pk if _pk in _subs else st.session_state.get("_last_" + _sk, _subs[0])
+        st.session_state["_last_" + _sk] = _sel
     else:
         _sel = _nav_pick
     _VALID = set(_key_of) | {"Patterns", "Method & data"}
@@ -3447,6 +3784,11 @@ if sub is not None:
         st.caption(
             "Partial months at the edges of the range appear in the detections view and are "
             "left blank in the anomaly view. Anomaly colours: orange above the median, purple below."
+        )
+
+        render_daily_calendar(
+            skey, S["years_present"], ramp, f"daycal_{match}_{aoi_key}",
+            pd.Timestamp(info["dmin"]), pd.Timestamp(info["dmax"]),
         )
 
         # Diurnal solar clock chart if acq_time was present
@@ -3777,44 +4119,100 @@ if sub is not None:
             tl, cell_t = timelapse_grid(skey)
             cap = max(float(tl["w"].quantile(0.99)), 1.0)
 
-            tile_style = style if style in ("Dark", "Light", "Satellite") else "Dark"
-            layer_def = dict(
-                below="traces",
-                sourcetype="raster",
-                source=[TILES[tile_style]["tiles"]],
-                sourceattribution="Tiles © Esri",
+            tl_view = st.radio(
+                "Timelapse view", ["Map", "Simple (no map tiles)"], horizontal=True,
+                key=f"tl_view_{match}",
+                help="Simple draws the cells on a plain dark canvas with the country outline. "
+                     "Use it if the base-map tiles do not load on your connection.",
             )
-            args = dict(
-                lat="lat",
-                lon="lon",
-                z="w",
-                radius=14,
-                animation_frame="year",
-                center=dict(lat=(lat_lo + lat_hi) / 2, lon=(lon_lo + lon_hi) / 2),
-                zoom=zoom_t,
-                color_continuous_scale="YlOrRd",
-                range_color=(0, cap),
-                opacity=0.85,
-            )
-            if hasattr(px, "density_map"):
-                fig_t = px.density_map(tl, map_style="white-bg", **args)
-                fig_t.update_layout(map_layers=[layer_def])
+
+            # country outline (shared by both views)
+            lon_l, lat_l = [], []
+            if match in geoms_wkb:
+                try:
+                    g_out = shapely.from_wkb(geoms_wkb[match]).simplify(0.02, preserve_topology=True)
+                    for pg in (list(g_out.geoms) if hasattr(g_out, "geoms") else [g_out]):
+                        if hasattr(pg, "exterior") and not pg.is_empty:
+                            xs_, ys_ = pg.exterior.xy
+                            lon_l += list(xs_) + [None]
+                            lat_l += list(ys_) + [None]
+                except Exception:
+                    lon_l, lat_l = [], []
+
+            if tl_view == "Map":
+                tile_style = style if TILES.get(style) else "Dark"
+                layer_def = dict(
+                    below="traces",
+                    sourcetype="raster",
+                    source=[TILES[tile_style]["tiles"]],
+                    sourceattribution=TILES[tile_style]["attr"],
+                )
+                args = dict(
+                    lat="lat", lon="lon", z="w", radius=14, animation_frame="year",
+                    center=dict(lat=(lat_lo + lat_hi) / 2, lon=(lon_lo + lon_hi) / 2),
+                    zoom=zoom_t, color_continuous_scale="YlOrRd", range_color=(0, cap), opacity=0.85,
+                )
+                # Solid background so detections stay visible when tiles do not load
+                bg_col = "#e6e6e6" if style == "Light" else "#121212"
+                bg_layer = dict(
+                    below="traces", sourcetype="geojson", type="fill", color=bg_col, opacity=1.0,
+                    source={"type": "Feature", "properties": {}, "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[[-180, -85], [180, -85], [180, 85], [-180, 85], [-180, -85]]],
+                    }},
+                )
+                layers = [bg_layer] + ([layer_def] if TILES.get(style) else [])
+                new_api = hasattr(px, "density_map")
+                if new_api:
+                    fig_t = px.density_map(tl, map_style="white-bg", **args)
+                    fig_t.update_layout(map_layers=layers)
+                else:
+                    fig_t = px.density_mapbox(tl, mapbox_style="white-bg", **args)
+                    fig_t.update_layout(mapbox_layers=layers)
+                if lon_l:
+                    Scatter = go.Scattermap if new_api else go.Scattermapbox
+                    fig_t.add_trace(Scatter(
+                        lon=lon_l, lat=lat_l, mode="lines", hoverinfo="skip", showlegend=False,
+                        line=dict(color="rgba(184,184,184,0.55)", width=1),
+                    ))
+                fig_t.update_layout(
+                    height=640, margin=dict(l=0, r=0, t=0, b=0), paper_bgcolor="rgba(0,0,0,0)",
+                    font=dict(family=FONT_PLOT, color="#b8b8b8"),
+                    coloraxis_colorbar=dict(title="Detections / cell", thickness=12, tickfont=dict(color="#8f8f8f")),
+                )
             else:
-                fig_t = px.density_mapbox(tl, mapbox_style="white-bg", **args)
-                fig_t.update_layout(mapbox_layers=[layer_def])
-            fig_t.update_layout(
-                height=640,
-                margin=dict(l=0, r=0, t=0, b=0),
-                paper_bgcolor="rgba(0,0,0,0)",
-                font=dict(family=FONT_PLOT, color="#b8b8b8"),
-                coloraxis_colorbar=dict(title="Detections / cell", thickness=12, tickfont=dict(color="#8f8f8f")),
-            )
+                dlon = max(lon_hi - lon_lo, 0.05)
+                px_cell = float(np.clip(cell_t / dlon * 900, 3, 18))
+                tl2 = tl.assign(sz=1.0, sym="cell")
+                fig_t = px.scatter(
+                    tl2, x="lon", y="lat", color="w", animation_frame="year",
+                    size="sz", size_max=px_cell, symbol="sym", symbol_sequence=["square"],
+                    color_continuous_scale="YlOrRd", range_color=(0, cap), opacity=0.9,
+                    labels=dict(w="Detections / cell"),
+                )
+                pad_x, pad_y = dlon * 0.04, max(lat_hi - lat_lo, 0.05) * 0.04
+                fig_t.update_xaxes(range=[lon_lo - pad_x, lon_hi + pad_x], visible=False)
+                fig_t.update_yaxes(
+                    range=[lat_lo - pad_y, lat_hi + pad_y], visible=False,
+                    scaleanchor="x", scaleratio=1.0 / max(np.cos(np.radians((lat_lo + lat_hi) / 2)), 0.1),
+                )
+                if lon_l:
+                    fig_t.add_trace(go.Scatter(
+                        x=lon_l, y=lat_l, mode="lines", hoverinfo="skip", showlegend=False,
+                        line=dict(color="rgba(184,184,184,0.55)", width=1),
+                    ))
+                fig_t.update_layout(
+                    height=640, margin=dict(l=0, r=0, t=0, b=0), showlegend=False,
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#121212",
+                    font=dict(family=FONT_PLOT, color="#b8b8b8"),
+                    coloraxis_colorbar=dict(title="Detections / cell", thickness=12, tickfont=dict(color="#8f8f8f")),
+                )
             st.caption(
                 "Press play to watch the burning season by season. Each frame is one year of "
-                f"VIIRS-equivalent detections on a grid of about {cell_t:g}°. "
+                f"VIIRS-equivalent detections on a grid of about {cell_t:g}\u00b0. "
                 "The colour scale is locked across every frame so years can be compared directly."
             )
-            show(fig_t, f"timelapse-{match}-{aoi_key}")
+            show(fig_t, f"timelapse-{match}-{aoi_key}-{tl_view[:3]}")
         except Exception as exc:
             st.info(f"The timelapse could not be drawn here ({exc}). Update plotly to 5.24 or newer and try again.")
 
@@ -3822,7 +4220,8 @@ if sub is not None:
         render_compare()
 
     elif _sel == "Recent activity & sources":
-        render_predict(sub, style, match, bbox, aoi_poly, region_text, skey)
+        with st.spinner("Analysing recent activity and fire sources\u2026"):
+            render_predict(sub, style, match, bbox, aoi_poly, region_text, skey)
 
     elif _sel == "Harmonization":
         if not info["has_both"]:
@@ -4133,10 +4532,8 @@ if sub is not None:
 else:
     if match is None:
         st.markdown(
-            '<div class="masthead"><div class="region-head">'
-            '<span class="title">The Burn Record</span>'
-            '<span class="span">MODIS + VIIRS fire activity, 2000–present</span></div>'
-            '<p class="lede" style="margin:.4rem 0 1rem">Pick a country on the map, or jump straight in:</p></div>',
+            '<div class="masthead"><p class="lede" style="margin:.4rem 0 1rem">'
+            "Pick a country on the map, or jump straight in:</p></div>",
             unsafe_allow_html=True,
         )
         _all_loaded = [k for k in regions if has_data(k) and k not in ALIASES]
@@ -4156,7 +4553,7 @@ else:
                 if _qc[_i].button(_k.title(), key=f"quick_{_k}"):
                     st.session_state["_pending_region"] = _k
                     st.rerun()
-    render_map(None, height=540)
+    render_map(None, height=600)
     if match is None:
         loaded_keys = sorted(k for k in regions if has_data(k) and k not in ALIASES)
         if loaded_keys:
